@@ -146,7 +146,7 @@ module Connection = struct
   let active : t Table.t = Table.create ()
 
   let update_positions ({ addr_str; w; key; secret; positions } as c) =
-    let update_msg ?(price=0) ?(qty=0) symbol =
+    let write_update ?(price=0) ?(qty=0) symbol =
       let update = DTC.default_position_update () in
       update.trade_account <- Some margin_account ;
       update.total_number_messages <- Some 1l ;
@@ -155,7 +155,8 @@ module Connection = struct
       update.exchange <- Some exchange ;
       update.quantity <- Some (qty // 100_000_000) ;
       update.average_price <- Some (price // 100_000_000) ;
-      update in
+      Writer.write w (DTC.gen_position_update update |> Piqirun.to_string)
+    in
     Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
       Log.error log_plnx "update positions (%s): %s"
@@ -217,19 +218,19 @@ module Connection = struct
       ?request_id
       ?(nb_msgs=1)
       ?(msg_number=1) { addr_str; w; b_margin; margin } =
-    let update_cs =
-      Cstruct.of_bigarray ~off:0 ~len:Account.Balance.Update.sizeof_cs buf_cs in
-    let currency = "mBTC" in
-    let cash_balance = margin.total_value // 100_000 in
     let securities_value = margin.net_value // 100_000 in
-    let margin_requirement = margin.total_borrowed_value // 100_000 *. 0.2 in
-    let balance_available =
-      securities_value /. 0.4 -. margin.total_borrowed_value // 100_000 in
-    Account.Balance.Update.write
-      ?request_id ~nb_msgs ~msg_number ~trade_account:margin_account
-      ~currency ~cash_balance ~balance_available
-      ~securities_value ~margin_requirement update_cs;
-    Writer.write_cstruct w update_cs;
+    let balance = DTC.default_account_balance_update () in
+    balance.request_id <- request_id ;
+    balance.cash_balance <- Some (margin.total_value // 100_000) ;
+    balance.securities_value <- Some securities_value ;
+    balance.margin_requirement <- Some (margin.total_borrowed_value // 100_000 *. 0.2) ;
+    balance.balance_available_for_new_positions <-
+      Some (securities_value /. 0.4 -. margin.total_borrowed_value // 100_000) ;
+    balance.account_currency <- Some "mBTC" ;
+    balance.total_number_messages <- Int32.of_int nb_msgs ;
+    balance.message_number <- Int32.of_int msg_number ;
+    balance.trade_account <- Some margin_account ;
+    Writer.write w (DTC.gen_account_balance_update balance |> Piqirun.to_string) ;
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr_str margin_account msg_number nb_msgs
 
@@ -237,28 +238,27 @@ module Connection = struct
       ?request_id
       ?(nb_msgs=1)
       ?(msg_number=1) { addr_str; w; b_exchange } =
-    let update_cs =
-      Cstruct.of_bigarray ~off:0 ~len:Account.Balance.Update.sizeof_cs buf_cs in
-    let currency = "mBTC" in
     let b = String.Table.find b_exchange "BTC" |>
             Option.map ~f:begin fun { Rest.available; on_orders } ->
               available // 100_000, (available - on_orders) // 100_000
             end
     in
-    let cash_balance = Option.map b ~f:fst in
-    let balance_available = Option.map b ~f:snd in
     let securities_value =
       String.Table.fold b_exchange ~init:0
         ~f:begin fun ~key:_ ~data:{ Rest.btc_value } a ->
           a + btc_value end // 100_000
     in
-    let margin_requirement = 0. in
-    Account.Balance.Update.write
-      ?request_id ~nb_msgs ~msg_number
-      ~trade_account:exchange_account
-      ~currency ?cash_balance ?balance_available
-      ~securities_value ~margin_requirement update_cs;
-    Writer.write_cstruct w update_cs;
+    let balance = DTC.default_account_balance_update () in
+    balance.request_id <- request_id ;
+    balance.cash_balance <- Option.map b ~f:fst ;
+    balance.securities_value <- Some securities_value ;
+    balance.margin_requirement <- Some 0. ;
+    balance.balance_available_for_new_positions <- Option.map b ~f:snd ;
+    balance.account_currency <- Some "mBTC" ;
+    balance.total_number_messages <- Int32.of_int nb_msgs ;
+    balance.message_number <- Int32.of_int msg_number ;
+    balance.trade_account <- Some exchange_account ;
+    Writer.write w (DTC.gen_account_balance_update balance |> Piqirun.to_string) ;
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr_str exchange_account msg_number nb_msgs
 
@@ -330,41 +330,44 @@ module Connection = struct
 end
 
 let on_ticker_update buf_cs pair ts t t' =
-  let open MarketData in
   let send_update_msgs depth symbol_id w =
+    let symbol_id = Int32.of_int_exn symbol_id in
     if t.base_volume <> t'.base_volume then begin
-      let cs = Cstruct.of_bigarray buf_cs ~len:UpdateSession.sizeof_cs in
-      UpdateSession.write ~kind:`Volume ~symbol_id ~data:t'.base_volume cs;
-      Writer.write_cstruct w cs
+      let update = DTC.default_market_data_update_session_volume () in
+      update.symbol_id <- Some symbol_id ;
+      update.volume <- Some (t'.base_volume) ;
+      Writer.write w (DTC.gen_market_data_update_session_volume update |> Piqirun.to_string)
     end;
     if t.low24h <> t'.low24h then begin
-      let cs = Cstruct.of_bigarray buf_cs ~len:UpdateSession.sizeof_cs in
-      UpdateSession.write ~kind:`Low ~symbol_id ~data:t'.low24h cs;
-      Writer.write_cstruct w cs
+      let update = DTC.default_market_data_update_session_low () in
+      update.symbol_id <- Some symbol_id ;
+      update.price <- Some (t'.low24h) ;
+      Writer.write w (DTC.gen_market_data_update_session_low update |> Piqirun.to_string)
     end;
     if t.high24h <> t'.high24h then begin
-      let cs = Cstruct.of_bigarray buf_cs ~len:UpdateSession.sizeof_cs in
-      UpdateSession.write ~kind:`High ~symbol_id ~data:t'.high24h cs;
-      Writer.write_cstruct w cs
+      let update = DTC.default_market_data_update_session_high () in
+      update.symbol_id <- Some symbol_id ;
+      update.price <- Some (t'.high24h) ;
+      Writer.write w (DTC.gen_market_data_update_session_high update |> Piqirun.to_string)
     end;
     if t.last <> t'.last then begin
-      let cs = Cstruct.of_bigarray buf_cs ~len:UpdateLastTradeSnapshot.sizeof_cs in
-      UpdateLastTradeSnapshot.write cs ~symbol_id
-        ~ts:(float_of_ts ts) ~price:t'.last ~qty:0.;
-      Writer.write_cstruct w cs
+      let update = DTC.default_market_data_update_last_trade_snapshot () in
+      update.symbol_id <- Some symbol_id ;
+      update.last_trade_date_time <- Some (float_of_ts ts) ;
+      update.last_trade_price <- Some (t'.last) ;
+      Writer.write w (DTC.gen_market_data_update_last_trade_snapshot update |> Piqirun.to_string)
     end;
     if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
-      let cs = Cstruct.of_bigarray buf_cs ~len:UpdateBidAsk.sizeof_cs in
-      UpdateBidAsk.write cs
-        ~symbol_id ~ts ~bid:t'.bid ~bid_qty:0. ~ask:t'.ask ~ask_qty:0.;
-      Writer.write_cstruct w cs
+      let update = DTC.default_market_data_update_bid_ask () in
+      update.symbol_id <- Some symbol_id ;
+      update.bid_price <- Some (t'.bid) ;
+      update.ask_price <- Some (t'.ask) ;
+      Writer.write w (DTC.gen_market_data_update_bid_ask update |> Piqirun.to_string)
     end;
   in
   let send_secdef_msg w t =
     let secdef = secdef_of_ticker ~final:true t in
-    let secdef_resp_cs = Cstruct.of_bigarray buf_cs ~len:UpdateSession.sizeof_cs in
-    SecurityDefinition.Response.to_cstruct secdef_resp_cs secdef;
-    Writer.write_cstruct w secdef_resp_cs in
+    Writer.write w (DTC.gen_security_definition_response secdef |> Piqirun.to_string) in
   let on_connection { Connection.addr; addr_str; w; subs; subs_depth; send_secdefs } =
     let on_symbol_id ?(depth=false) symbol_id =
       send_update_msgs depth symbol_id w;
@@ -378,21 +381,22 @@ let on_ticker_update buf_cs pair ts t t' =
   in
   Connection.(Table.iter active ~f:on_connection)
 
+let at_bid_or_ask side = match side with `Buy -> `at_bid | `Sell -> `at_ask
+
 let on_trade_update buf_cs pair ({ DB.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
   String.Table.set latest_trades pair t;
   (* Send trade updates to subscribers. *)
-  let cs = Cstruct.of_bigarray buf_cs ~len:MarketData.UpdateTrade.sizeof_cs in
   let on_connection { Connection.addr; addr_str; w; subs; _} =
     let on_symbol_id symbol_id =
-      MarketData.UpdateTrade.write
-        ~symbol_id
-        ~side
-        ~p:(price // 100_000_000)
-        ~v:(qty // 100_000_000)
-        ~ts
-        cs;
-      Writer.write_cstruct w cs;
+      let update = DTC.default_market_data_update_trade () in
+      let symbol_id = Int32.of_int_exn symbol_id in
+      update.symbol_id <- Some symbol_id ;
+      update.at_bid_or_ask <- Some (at_bid_or_ask side) ;
+      update.price <- Some (price // 100_000_000) ;
+      update.volume <- Some (qty // 100_000_000) ;
+      update.date_time <- Some (Time_ns.to_int_ns_since_epoch ts // 1_000_000_000) ;
+      Writer.write w (DTC.gen_market_data_update_trade update |> Piqirun.to_string) ;
       Log.debug log_dtc "-> %s %s %s"
         addr_str pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
     in
@@ -422,22 +426,23 @@ let on_book_updates buf_cs pair ts updates =
   let { Book.bid; ask } =  List.fold_left ~init:book updates ~f:fold_updates in
   book.bid <- bid;
   book.ask <- ask;
-  let send_depth_updates addr_str w cs symbol_id u =
+  let send_depth_updates addr_str w symbol_id u =
     Log.debug log_dtc "-> %s depth %s %s"
       addr_str pair (DB.sexp_of_book_entry u |> Sexplib.Sexp.to_string);
-    MarketDepth.Update.write
-      ~op:(if u.qty = 0 then `Delete else `Insert_update)
-      ~p:(u.price // 100_000_000)
-      ~v:(u.qty // 100_000_000)
-      ~symbol_id
-      ~side:u.side
-      cs;
-    Writer.write_cstruct w cs;
+    let symbol_id = Int32.of_int_exn symbol_id in
+    let update_type = if u.qty = 0 then `market_depth_delete_level else
+        `market_depth_insert_update_level in
+    let update = DTC.default_market_depth_update_level () in
+    update.symbol_id <- Some symbol_id ;
+    update.side <- Some (at_bid_or_ask u.side) ;
+    update.update_type <- Some update_type ;
+    update.price <- Some (u.price // 100_000_000) ;
+    update.quantity <- Some (u.qty // 100_000_000) ;
+    Writer.write w (DTC.gen_market_depth_update_level update |> Piqirun.to_string)
   in
-  let cs = Cstruct.of_bigarray buf_cs ~len:MarketDepth.Update.sizeof_cs in
   let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _ } =
     let on_symbol_id symbol_id =
-      List.iter updates ~f:(send_depth_updates addr_str w cs symbol_id);
+      List.iter updates ~f:(send_depth_updates addr_str w symbol_id);
     in
     Option.iter String.Table.(find subs_depth pair) ~f:on_symbol_id
   in
@@ -496,34 +501,36 @@ let ws ?heartbeat ?wait_for_pong () =
     (fun exn -> Log.error log_plnx "%s" @@ Exn.to_string exn)
 
 let heartbeat addr w ival =
-  let open Logon.Heartbeat in
-  let cs = Cstruct.create sizeof_cs in
   let rec loop () =
+    let msg = DTC.default_heartbeat () in
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
     let { Connection.addr_str; dropped; _ } = Connection.(Table.find_exn active addr) in
     Log.debug log_dtc "-> %s HEARTBEAT" addr_str;
-    write ~dropped_msgs:dropped cs;
-    Writer.write_cstruct w cs;
+    msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
+    Writer.write w (DTC.gen_heartbeat msg |> Piqirun.to_string) ;
     loop ()
   in
   loop ()
 
-let process addr w msg_cs scratchbuf =
-  let open Dtc in
+let process addr w (msgtype : DTC.dtcmessage_type) msg scratchbuf =
   let addr_str = Socket.Address.Inet.to_string addr in
   (* Erase scratchbuf by security. *)
   Bigstring.set_tail_padded_fixed_string
     scratchbuf ~padding:'\x00' ~pos:0 ~len:(Bigstring.length scratchbuf) "";
 
-  match msg_of_enum Cstruct.LE.(get_uint16 msg_cs 2) with
-  | Some EncodingRequest ->
+  match msgtype with
+  | `encoding_request ->
     let open Encoding in
     Log.debug log_dtc "<- ENCODING REQUEST";
-    let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
-    Response.write response_cs;
-    Writer.write_cstruct w response_cs
+    let _req = DTC.parse_encoding_request msg in
+    (* TODO: check _req is acceptable *)
+    let resp = DTC.default_encoding_response () in
+    resp.protocol_version <- Some 7l;
+    resp.encoding <- Some `protocol_buffers ;
+    resp.protocol_type <- Some "DTC" ;
+    Writer.write w (DTC.gen_encoding_response resp |> Piqirun.to_string)
 
-  | Some LogonRequest ->
+  | `logon_request ->
     let open Logon in
     let m = Request.read msg_cs in
     let response_cs = Cstruct.of_bigarray scratchbuf ~len:Response.sizeof_cs in
@@ -1086,8 +1093,11 @@ let dtcserver ~server ~port =
         Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen;
         if len < msglen then return @@ `Consumed (consumed, `Need msglen)
         else begin
-          let msg_cs = Cstruct.of_bigarray buf ~off:pos ~len:msglen in
-          process addr w msg_cs scratchbuf;
+          let msgtype = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
+          let msgtype = DTC.parse_dtcmessage_type (Piqirun.Varint msgtype) in
+          let msg = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
+          let msg = Piqirun.init_from_string msg in
+          process addr w msgtype msg scratchbuf;
           handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
         end
     in
