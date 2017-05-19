@@ -66,7 +66,6 @@ let currencies : Rest.currency String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * ticker) String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
-let buf_cs = Bigstring.create 4096
 
 let failure_of_error e =
   match Error.to_exn e |> Monitor.extract_exn with
@@ -85,7 +84,7 @@ let descr_of_symbol s =
     Buffer.contents buf
   | _ -> invalid_argf "descr_of_symbol: %s" s ()
 
-let secdef_of_ticker ?(request_id=110_000_000l) ?(final=true) t =
+let secdef_of_ticker ?(request_id=0l) ?(final=true) t =
   let secdef = DTC.default_security_definition_response () in
   secdef.request_id <- Some request_id ;
   secdef.is_final_message <- Some final ;
@@ -338,54 +337,54 @@ module Connection = struct
     end
 end
 
-let on_ticker_update buf_cs pair ts t t' =
-  let send_update_msgs depth symbol_id w =
-    if t.base_volume <> t'.base_volume then begin
-      let update = DTC.default_market_data_update_session_volume () in
-      update.symbol_id <- Some symbol_id ;
-      update.volume <- Some (t'.base_volume) ;
-      write_message w `market_data_update_session_volume
-        DTC.gen_market_data_update_session_volume update
-    end;
-    if t.low24h <> t'.low24h then begin
-      let update = DTC.default_market_data_update_session_low () in
-      update.symbol_id <- Some symbol_id ;
-      update.price <- Some (t'.low24h) ;
-      write_message w `market_data_update_session_low
-        DTC.gen_market_data_update_session_low update
-    end;
-    if t.high24h <> t'.high24h then begin
-      let update = DTC.default_market_data_update_session_high () in
-      update.symbol_id <- Some symbol_id ;
-      update.price <- Some (t'.high24h) ;
-      write_message w `market_data_update_session_high
-        DTC.gen_market_data_update_session_high update
-    end;
-    if t.last <> t'.last then begin
-      let update = DTC.default_market_data_update_last_trade_snapshot () in
-      update.symbol_id <- Some symbol_id ;
-      update.last_trade_date_time <- Some (float_of_ts ts) ;
-      update.last_trade_price <- Some (t'.last) ;
-      write_message w `market_data_update_last_trade_snapshot
-        DTC.gen_market_data_update_last_trade_snapshot update
-    end;
-    if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
-      let update = DTC.default_market_data_update_bid_ask () in
-      update.symbol_id <- Some symbol_id ;
-      update.bid_price <- Some (t'.bid) ;
-      update.ask_price <- Some (t'.ask) ;
-      write_message w `market_data_update_bid_ask
-        DTC.gen_market_data_update_bid_ask update
-    end;
-  in
+let send_update_msgs depth symbol_id w ts t t' =
+  if t.base_volume <> t'.base_volume then begin
+    let update = DTC.default_market_data_update_session_volume () in
+    update.symbol_id <- Some symbol_id ;
+    update.volume <- Some (t'.base_volume) ;
+    write_message w `market_data_update_session_volume
+      DTC.gen_market_data_update_session_volume update
+  end;
+  if t.low24h <> t'.low24h then begin
+    let update = DTC.default_market_data_update_session_low () in
+    update.symbol_id <- Some symbol_id ;
+    update.price <- Some (t'.low24h) ;
+    write_message w `market_data_update_session_low
+      DTC.gen_market_data_update_session_low update
+  end;
+  if t.high24h <> t'.high24h then begin
+    let update = DTC.default_market_data_update_session_high () in
+    update.symbol_id <- Some symbol_id ;
+    update.price <- Some (t'.high24h) ;
+    write_message w `market_data_update_session_high
+      DTC.gen_market_data_update_session_high update
+  end;
+  if t.last <> t'.last then begin
+    let update = DTC.default_market_data_update_last_trade_snapshot () in
+    update.symbol_id <- Some symbol_id ;
+    update.last_trade_date_time <- Some (float_of_ts ts) ;
+    update.last_trade_price <- Some (t'.last) ;
+    write_message w `market_data_update_last_trade_snapshot
+      DTC.gen_market_data_update_last_trade_snapshot update
+  end;
+  if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
+    let update = DTC.default_market_data_update_bid_ask () in
+    update.symbol_id <- Some symbol_id ;
+    update.bid_price <- Some (t'.bid) ;
+    update.ask_price <- Some (t'.ask) ;
+    write_message w `market_data_update_bid_ask
+      DTC.gen_market_data_update_bid_ask update
+  end
+
+let on_ticker_update pair ts t t' =
   let send_secdef_msg w t =
     let secdef = secdef_of_ticker ~final:true t in
     write_message w `security_definition_response
       DTC.gen_security_definition_response secdef in
   let on_connection { Connection.addr; addr_str; w; subs; subs_depth; send_secdefs } =
     let on_symbol_id ?(depth=false) symbol_id =
-      send_update_msgs depth symbol_id w;
-      Log.debug log_dtc "-> %s ticker %s" addr_str pair
+      send_update_msgs depth symbol_id w ts t t';
+      Log.debug log_dtc "-> [%s] %s TICKER" addr_str pair
     in
     if send_secdefs && phys_equal t t' then send_secdef_msg w t ;
     match String.Table.(find subs pair, find subs_depth pair) with
@@ -417,7 +416,7 @@ let buy_sell_of_dtc : DTC.buy_sell_enum -> side = function
   | `sell -> `Sell
   | _ -> invalid_arg "buy_sell_of_dtc"
 
-let on_trade_update buf_cs pair ({ DB.ts; side; price; qty } as t) =
+let on_trade_update pair ({ DB.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
   String.Table.set latest_trades pair t;
   (* Send trade updates to subscribers. *)
@@ -431,14 +430,14 @@ let on_trade_update buf_cs pair ({ DB.ts; side; price; qty } as t) =
       update.date_time <- Some (float_of_time ts) ;
       write_message w `market_data_update_trade
         DTC.gen_market_data_update_trade update ;
-      Log.debug log_dtc "-> %s %s %s"
-        addr_str pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
+      Log.debug log_dtc "-> [%s] %s T %s"
+        addr_str pair (Format.asprintf "%a" DB.pp_trade t);
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
   Connection.(Table.iter active ~f:on_connection)
 
-let on_book_updates buf_cs pair ts updates =
+let on_book_updates pair ts updates =
   let book = String.Table.find_or_add books pair ~default:Book.create in
   let fold_updates { Book.bid; ask } ({ side; price; qty } : DB.book_entry) =
     match side with
@@ -461,8 +460,8 @@ let on_book_updates buf_cs pair ts updates =
   book.bid <- bid;
   book.ask <- ask;
   let send_depth_updates addr_str w symbol_id u =
-    Log.debug log_dtc "-> %s depth %s %s"
-      addr_str pair (DB.sexp_of_book_entry u |> Sexplib.Sexp.to_string);
+    Log.debug log_dtc "-> [%s] %s D %s"
+      addr_str pair (Format.asprintf "%a" DB.pp_book_entry u);
     let update_type = if u.qty = 0 then `market_depth_delete_level else
         `market_depth_insert_update_level in
     let update = DTC.default_market_depth_update_level () in
@@ -488,7 +487,6 @@ let subscribe to_ws_w sym =
   | _ -> invalid_argf "subscribe to %s" sym ()
 
 let ws ?heartbeat ?wait_for_pong () =
-  let scratch = Bigstring.create 4096 in
   let to_ws, to_ws_w = Pipe.create () in
   let on_ws_msg msg =
     let now = Time_ns.now () in
@@ -510,7 +508,7 @@ let ws ?heartbeat ?wait_for_pong () =
         let old_ts, old_t =
           Option.value ~default:(Time_ns.epoch, t) @@ String.Table.find tickers symbol in
         String.Table.set tickers symbol (now, t);
-        on_ticker_update scratch symbol now old_t t
+        on_ticker_update symbol now old_t t
       | sym ->
         let iter_f msg = match Ws.Msgpck.of_msgpck msg with
         | Error msg -> failwith msg
@@ -518,11 +516,11 @@ let ws ?heartbeat ?wait_for_pong () =
           let t = Ws.Msgpck.trade_of_msgpck data in
           Log.debug log_plnx "<- %s %s"
             sym @@ Fn.compose Sexp.to_string DB.sexp_of_trade t;
-          on_trade_update scratch sym t
+          on_trade_update sym t
         | Ok { typ="orderBookModify"; data } ->
-          on_book_updates scratch sym now [Ws.Msgpck.book_of_msgpck data];
+          on_book_updates sym now [Ws.Msgpck.book_of_msgpck data];
         | Ok { typ="orderBookRemove"; data } ->
-          on_book_updates scratch sym now [Ws.Msgpck.book_of_msgpck data];
+          on_book_updates sym now [Ws.Msgpck.book_of_msgpck data];
         | Ok { typ } -> failwithf "unexpected message type %s" typ ()
         in
         List.iter args ~f:iter_f
@@ -540,7 +538,7 @@ let heartbeat addr w ival =
     let msg = DTC.default_heartbeat () in
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
     let { Connection.addr_str; dropped; _ } = Connection.(Table.find_exn active addr) in
-    Log.debug log_dtc "-> %s Heartbeat" addr_str;
+    Log.debug log_dtc "-> [%s] Heartbeat" addr_str;
     msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
     write_message w `heartbeat DTC.gen_heartbeat msg ;
     loop ()
@@ -570,6 +568,7 @@ let logon_response ~result_text ~trading_supported =
   resp.market_depth_is_supported <- Some true ;
   resp.bracket_orders_supported <- Some false ;
   resp.market_data_supported <- Some true ;
+  resp.symbol_exchange_delimiter <- Some "-" ;
   resp
 
 let logon_request addr w msg =
@@ -588,7 +587,7 @@ let logon_request addr w msg =
     write_message w `logon_response
       DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
     Log.debug log_dtc "-> [%s] Logon Response (%s)" addr_str result_text ;
-    if send_secdefs then begin
+    begin
       String.Table.iter tickers ~f:begin fun (ts, t) ->
         let secdef = secdef_of_ticker ~final:true t in
         write_message w `security_definition_response
@@ -615,7 +614,7 @@ let logon_request addr w msg =
 
 let heartbeat addr w msg =
   let { Connection.addr_str; _ } = Connection.(Table.find_exn active addr) in
-  Log.debug log_dtc "<- %s Heartbeat" addr_str
+  Log.debug log_dtc "<- [%s] Heartbeat" addr_str
 
 let security_definition_request addr w msg =
   let reject addr_str request_id symbol =
@@ -698,6 +697,53 @@ let market_data_request addr w msg =
       else accept ()
     | _ -> ()
 
+let market_depth_accept
+    ~conn:{ Connection.addr_str ; w ; subs_depth }
+    ~req
+    ~books:{ Book.bid ; ask } =
+  (* OK because we sanitize before *******************************************)
+  let symbol_id = Option.value_exn req.DTC.Market_depth_request.symbol_id in
+  let symbol = Option.value_exn req.DTC.Market_depth_request.symbol in
+  let exchange = Option.value_exn req.DTC.Market_depth_request.exchange in
+  (****************************************************************************)
+  String.Table.set subs_depth symbol symbol_id;
+  let snap = DTC.default_market_depth_snapshot_level () in
+  ignore @@ Int.Map.fold_right bid ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
+    snap.symbol_id <- Some symbol_id ;
+    snap.side <- Some `at_bid ;
+    snap.price <- Some (price // 100_000_000) ;
+    snap.quantity <- Some (qty // 100_000_000) ;
+    snap.level <- Some lvl ;
+    snap.is_first_message_in_batch <- Some (lvl = 1l) ;
+    snap.is_last_message_in_batch <- Some false ;
+    write_message w `market_depth_snapshot_level
+      DTC.gen_market_depth_snapshot_level snap ;
+    Int32.succ lvl
+  end;
+  ignore @@ Int.Map.fold ask ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
+    snap.symbol_id <- Some symbol_id ;
+    snap.side <- Some `at_ask ;
+    snap.price <- Some (price // 100_000_000) ;
+    snap.quantity <- Some (qty // 100_000_000) ;
+    snap.level <- Some lvl ;
+    snap.is_first_message_in_batch <- Some (lvl = 1l && Int.Map.is_empty bid) ;
+    snap.is_last_message_in_batch <- Some false ;
+    write_message w `market_depth_snapshot_level
+      DTC.gen_market_depth_snapshot_level snap ;
+    Int32.succ lvl
+  end;
+  snap.symbol_id <- Some symbol_id ;
+  snap.side <- None ;
+  snap.price <- None ;
+  snap.quantity <- None ;
+  snap.level <- None ;
+  snap.is_first_message_in_batch <- Some false ;
+  snap.is_last_message_in_batch <- Some true ;
+  write_message w `market_depth_snapshot_level
+    DTC.gen_market_depth_snapshot_level snap ;
+  Log.debug log_dtc "-> [%s] Market Depth Snapshot %s-%s (%d/%d)"
+    addr_str symbol exchange (Int.Map.length bid) (Int.Map.length ask)
+
 let market_depth_request addr w msg =
   let addr_str = Socket.Address.Inet.to_string addr in
   let reject w symbol_id k = Printf.ksprintf begin fun reject_text ->
@@ -711,47 +757,10 @@ let market_depth_request addr w msg =
     end k
   in
   let req = DTC.parse_market_depth_request msg in
-  let { Connection.addr_str; subs_depth; _ } = Connection.(Table.find_exn active addr) in
+  let ({ Connection.addr_str; subs_depth; _ } as conn) = Connection.(Table.find_exn active addr) in
   match req.symbol_id, req.symbol, req.exchange with
     | Some symbol_id, Some symbol, Some exchange ->
-      Log.debug log_dtc "<- [%s] %ld %s %s" addr_str symbol_id symbol exchange ;
-      let accept { Book.bid; ask } =
-        String.Table.set subs_depth symbol symbol_id;
-        let snap = DTC.default_market_depth_snapshot_level () in
-        ignore @@ Int.Map.fold_right bid ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-          snap.symbol_id <- Some symbol_id ;
-          snap.side <- Some `at_bid ;
-          snap.price <- Some (price // 100_000_000) ;
-          snap.quantity <- Some (qty // 100_000_000) ;
-          snap.level <- Some lvl ;
-          snap.is_first_message_in_batch <- Some (lvl = 1l) ;
-          snap.is_last_message_in_batch <- Some false ;
-          write_message w `market_depth_snapshot_level
-            DTC.gen_market_depth_snapshot_level snap ;
-          Int32.succ lvl
-        end;
-        ignore @@ Int.Map.fold ask ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-          snap.symbol_id <- Some symbol_id ;
-          snap.side <- Some `at_bid ;
-          snap.price <- Some (price // 100_000_000) ;
-          snap.quantity <- Some (qty // 100_000_000) ;
-          snap.level <- Some lvl ;
-          snap.is_first_message_in_batch <- Some (lvl = 1l && Int.Map.is_empty bid) ;
-          snap.is_last_message_in_batch <- Some false ;
-          write_message w `market_depth_snapshot_level
-            DTC.gen_market_depth_snapshot_level snap ;
-          Int32.succ lvl
-        end;
-        snap.symbol_id <- Some symbol_id ;
-        snap.side <- None ;
-        snap.price <- None ;
-        snap.quantity <- None ;
-        snap.level <- None ;
-        snap.is_first_message_in_batch <- Some false ;
-        snap.is_last_message_in_batch <- Some true ;
-        write_message w `market_depth_snapshot_level
-          DTC.gen_market_depth_snapshot_level snap
-      in
+      Log.debug log_dtc "<- [%s] Market Depth Request %s-%s" addr_str symbol exchange ;
       if req.request_action = Some `unsubscribe then
         String.Table.remove subs_depth symbol
       else if exchange <> my_exchange then
@@ -761,7 +770,7 @@ let market_depth_request addr w msg =
       else begin match String.Table.find books symbol with
         | None ->
           reject w symbol_id "No orderbook for %s-%s" symbol exchange
-        | Some b -> accept b
+        | Some books -> market_depth_accept ~conn ~req ~books
       end
     | _ -> ()
 
