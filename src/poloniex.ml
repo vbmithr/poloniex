@@ -7,6 +7,16 @@ open Bs_api.PLNX
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
+let write_message w (typ : DTC.dtcmessage_type) gen msg =
+  let typ =
+    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
+  let msg = (gen msg |> Piqirun.to_string) in
+  let header = Bytes.create 4 in
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
+  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
+  Writer.write w header ;
+  Writer.write w msg
+
 let rec loop_log_errors ?log f =
   let rec inner () =
     Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
@@ -27,7 +37,6 @@ let conduit_server ~tls ~crt_path ~key_path =
   return `TCP
 
 let my_exchange = "PLNX"
-let plnx_historical = ref ""
 let exchange_account = "exchange"
 let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 10
@@ -155,7 +164,7 @@ module Connection = struct
       update.exchange <- Some my_exchange ;
       update.quantity <- Some (qty // 100_000_000) ;
       update.average_price <- Some (price // 100_000_000) ;
-      Writer.write w (DTC.gen_position_update update |> Piqirun.to_string)
+      write_message w `position_update DTC.gen_position_update update
     in
     Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
@@ -230,7 +239,7 @@ module Connection = struct
     balance.total_number_messages <- Int32.of_int nb_msgs ;
     balance.message_number <- Int32.of_int msg_number ;
     balance.trade_account <- Some margin_account ;
-    Writer.write w (DTC.gen_account_balance_update balance |> Piqirun.to_string) ;
+    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr_str margin_account msg_number nb_msgs
 
@@ -258,7 +267,7 @@ module Connection = struct
     balance.total_number_messages <- Int32.of_int nb_msgs ;
     balance.message_number <- Int32.of_int msg_number ;
     balance.trade_account <- Some exchange_account ;
-    Writer.write w (DTC.gen_account_balance_update balance |> Piqirun.to_string) ;
+    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr_str exchange_account msg_number nb_msgs
 
@@ -335,38 +344,44 @@ let on_ticker_update buf_cs pair ts t t' =
       let update = DTC.default_market_data_update_session_volume () in
       update.symbol_id <- Some symbol_id ;
       update.volume <- Some (t'.base_volume) ;
-      Writer.write w (DTC.gen_market_data_update_session_volume update |> Piqirun.to_string)
+      write_message w `market_data_update_session_volume
+        DTC.gen_market_data_update_session_volume update
     end;
     if t.low24h <> t'.low24h then begin
       let update = DTC.default_market_data_update_session_low () in
       update.symbol_id <- Some symbol_id ;
       update.price <- Some (t'.low24h) ;
-      Writer.write w (DTC.gen_market_data_update_session_low update |> Piqirun.to_string)
+      write_message w `market_data_update_session_low
+        DTC.gen_market_data_update_session_low update
     end;
     if t.high24h <> t'.high24h then begin
       let update = DTC.default_market_data_update_session_high () in
       update.symbol_id <- Some symbol_id ;
       update.price <- Some (t'.high24h) ;
-      Writer.write w (DTC.gen_market_data_update_session_high update |> Piqirun.to_string)
+      write_message w `market_data_update_session_high
+        DTC.gen_market_data_update_session_high update
     end;
     if t.last <> t'.last then begin
       let update = DTC.default_market_data_update_last_trade_snapshot () in
       update.symbol_id <- Some symbol_id ;
       update.last_trade_date_time <- Some (float_of_ts ts) ;
       update.last_trade_price <- Some (t'.last) ;
-      Writer.write w (DTC.gen_market_data_update_last_trade_snapshot update |> Piqirun.to_string)
+      write_message w `market_data_update_last_trade_snapshot
+        DTC.gen_market_data_update_last_trade_snapshot update
     end;
     if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
       let update = DTC.default_market_data_update_bid_ask () in
       update.symbol_id <- Some symbol_id ;
       update.bid_price <- Some (t'.bid) ;
       update.ask_price <- Some (t'.ask) ;
-      Writer.write w (DTC.gen_market_data_update_bid_ask update |> Piqirun.to_string)
+      write_message w `market_data_update_bid_ask
+        DTC.gen_market_data_update_bid_ask update
     end;
   in
   let send_secdef_msg w t =
     let secdef = secdef_of_ticker ~final:true t in
-    Writer.write w (DTC.gen_security_definition_response secdef |> Piqirun.to_string) in
+    write_message w `security_definition_response
+      DTC.gen_security_definition_response secdef in
   let on_connection { Connection.addr; addr_str; w; subs; subs_depth; send_secdefs } =
     let on_symbol_id ?(depth=false) symbol_id =
       send_update_msgs depth symbol_id w;
@@ -383,8 +398,24 @@ let on_ticker_update buf_cs pair ts t t' =
 let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
 let int32_of_time ts = Int32.of_int64_exn (int64_of_time ts)
-let at_bid_or_ask = function `Buy -> `at_bid | `Sell -> `at_ask
-let buy_sell = function `Buy -> `buy | `Sell -> `sell
+
+let at_bid_or_ask_to_dtc : side -> DTC.at_bid_or_ask_enum = function
+  | `Buy -> `at_bid
+  | `Sell -> `at_ask
+
+let at_bid_or_ask_of_dtc : DTC.at_bid_or_ask_enum -> side = function
+  | `at_bid -> `Buy
+  | `at_ask -> `Sell
+  | _ -> invalid_arg "at_bid_or_ask_of_dtc"
+
+let buy_sell_to_dtc : side -> DTC.buy_sell_enum = function
+  | `Buy -> `buy
+  | `Sell -> `sell
+
+let buy_sell_of_dtc : DTC.buy_sell_enum -> side = function
+  | `buy -> `Buy
+  | `sell -> `Sell
+  | _ -> invalid_arg "buy_sell_of_dtc"
 
 let on_trade_update buf_cs pair ({ DB.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
@@ -394,11 +425,12 @@ let on_trade_update buf_cs pair ({ DB.ts; side; price; qty } as t) =
     let on_symbol_id symbol_id =
       let update = DTC.default_market_data_update_trade () in
       update.symbol_id <- Some symbol_id ;
-      update.at_bid_or_ask <- Some (at_bid_or_ask side) ;
+      update.at_bid_or_ask <- Some (at_bid_or_ask_to_dtc side) ;
       update.price <- Some (price // 100_000_000) ;
       update.volume <- Some (qty // 100_000_000) ;
       update.date_time <- Some (float_of_time ts) ;
-      Writer.write w (DTC.gen_market_data_update_trade update |> Piqirun.to_string) ;
+      write_message w `market_data_update_trade
+        DTC.gen_market_data_update_trade update ;
       Log.debug log_dtc "-> %s %s %s"
         addr_str pair (DB.sexp_of_trade t |> Sexplib.Sexp.to_string);
     in
@@ -435,11 +467,12 @@ let on_book_updates buf_cs pair ts updates =
         `market_depth_insert_update_level in
     let update = DTC.default_market_depth_update_level () in
     update.symbol_id <- Some symbol_id ;
-    update.side <- Some (at_bid_or_ask u.side) ;
+    update.side <- Some (at_bid_or_ask_to_dtc u.side) ;
     update.update_type <- Some update_type ;
     update.price <- Some (u.price // 100_000_000) ;
     update.quantity <- Some (u.qty // 100_000_000) ;
-    Writer.write w (DTC.gen_market_depth_update_level update |> Piqirun.to_string)
+    write_message w `market_depth_update_level
+      DTC.gen_market_depth_update_level update
   in
   let on_connection { Connection.addr; addr_str; w; subs; subs_depth; _ } =
     let on_symbol_id symbol_id =
@@ -470,7 +503,7 @@ let ws ?heartbeat ?wait_for_pong () =
       let sym = Int.Table.find_exn reqid_to_sym reqid in
       Int.Table.set subid_to_sym id sym;
       String.Table.set sym_to_subid sym id
-    | Event { Wamp.pubid; subid; details; args; kwArgs } ->
+    | Event { pubid; subid; details; args; kwArgs } ->
       begin match Int.Table.find_exn subid_to_sym subid with
       | "ticker" ->
         let { symbol } as t = Ws.Msgpck.ticker_of_msgpck @@ List args in
@@ -507,23 +540,37 @@ let heartbeat addr w ival =
     let msg = DTC.default_heartbeat () in
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
     let { Connection.addr_str; dropped; _ } = Connection.(Table.find_exn active addr) in
-    Log.debug log_dtc "-> %s HEARTBEAT" addr_str;
+    Log.debug log_dtc "-> %s Heartbeat" addr_str;
     msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
-    Writer.write w (DTC.gen_heartbeat msg |> Piqirun.to_string) ;
+    write_message w `heartbeat DTC.gen_heartbeat msg ;
     loop ()
   in
   loop ()
 
-let encoding_request addr w msg =
+let encoding_request addr w req =
+  let addr_str = Socket.Address.Inet.to_string addr in
   let open Encoding in
-  Log.debug log_dtc "<- Encoding Request";
-  let _req = DTC.parse_encoding_request msg in
-  (* TODO: check _req is acceptable *)
-  let resp = DTC.default_encoding_response () in
-  resp.protocol_version <- Some 7l;
-  resp.encoding <- Some `protocol_buffers ;
-  resp.protocol_type <- Some "DTC" ;
-  Writer.write w (DTC.gen_encoding_response resp |> Piqirun.to_string)
+  Log.debug log_dtc "<- [%s] Encoding Request" addr_str ;
+  Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
+  Writer.write w ;
+  Log.debug log_dtc "-> [%s] Encoding Response" addr_str
+
+let logon_response ~result_text ~trading_supported =
+  let resp = DTC.default_logon_response () in
+  resp.server_name <- Some "Poloniex" ;
+  resp.protocol_version <- Some 7l ;
+  resp.result <- Some `logon_success ;
+  resp.result_text <- Some result_text ;
+  resp.market_depth_updates_best_bid_and_ask <- Some true ;
+  resp.trading_is_supported <- Some trading_supported ;
+  resp.ocoorders_supported <- Some false ;
+  resp.order_cancel_replace_supported <- Some true ;
+  resp.security_definitions_supported <- Some true ;
+  resp.historical_price_data_supported <- Some false ;
+  resp.market_depth_is_supported <- Some true ;
+  resp.bracket_orders_supported <- Some false ;
+  resp.market_data_supported <- Some true ;
+  resp
 
 let logon_request addr w msg =
   let addr_str = Socket.Address.Inet.to_string addr in
@@ -531,22 +578,6 @@ let logon_request addr w msg =
   let int1 = Option.value ~default:0l req.integer_1 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
   Log.debug log_dtc "<- [%s] Logon Request" addr_str;
-  let logon_response ~result_text ~trading_supported =
-    let resp = DTC.default_logon_response () in
-    resp.server_name <- Some "Poloniex" ;
-    resp.result <- Some `logon_success ;
-    resp.result_text <- Some result_text ;
-    resp.market_depth_updates_best_bid_and_ask <- Some true ;
-    resp.trading_is_supported <- Some trading_supported ;
-    resp.ocoorders_supported <- Some false ;
-    resp.order_cancel_replace_supported <- Some true ;
-    resp.security_definitions_supported <- Some true ;
-    resp.historical_price_data_supported <- Some false ;
-    resp.market_depth_is_supported <- Some true ;
-    resp.bracket_orders_supported <- Some false ;
-    resp.market_data_supported <- Some true ;
-    resp
-  in
   let accept trading =
     let trading_supported, result_text =
       match trading with
@@ -554,13 +585,14 @@ let logon_request addr w msg =
       | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
     in
     don't_wait_for @@ heartbeat addr w req.heartbeat_interval_in_seconds;
-    Writer.write w (DTC.gen_logon_response (logon_response ~trading_supported ~result_text) |>
-                    Piqirun.to_string) ;
-    Log.debug log_dtc "-> [%s] %s" addr_str result_text;
+    write_message w `logon_response
+      DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
+    Log.debug log_dtc "-> [%s] Logon Response (%s)" addr_str result_text ;
     if send_secdefs then begin
       String.Table.iter tickers ~f:begin fun (ts, t) ->
         let secdef = secdef_of_ticker ~final:true t in
-        Writer.write w (DTC.gen_security_definition_response secdef |> Piqirun.to_string) ;
+        write_message w `security_definition_response
+          DTC.gen_security_definition_response secdef ;
         Log.debug log_dtc "Written secdef %s" t.symbol
       end
     end
@@ -583,7 +615,7 @@ let logon_request addr w msg =
 
 let heartbeat addr w msg =
   let { Connection.addr_str; _ } = Connection.(Table.find_exn active addr) in
-  Log.debug log_dtc "<- %s HEARTBEAT" addr_str
+  Log.debug log_dtc "<- %s Heartbeat" addr_str
 
 let security_definition_request addr w msg =
   let reject addr_str request_id symbol =
@@ -591,7 +623,8 @@ let security_definition_request addr w msg =
     let rej = DTC.default_security_definition_reject () in
     rej.request_id <- Some request_id ;
     rej.reject_text <- Some (Printf.sprintf "Unknown symbol %s" symbol) ;
-    Writer.write w (DTC.gen_security_definition_reject rej |> Piqirun.to_string)
+    write_message w `security_definition_reject
+      DTC.gen_security_definition_reject rej
   in
   let req = DTC.parse_security_definition_for_symbol_request msg in
   match req.request_id, req.symbol, req.exchange with
@@ -606,7 +639,8 @@ let security_definition_request addr w msg =
           let secdef = secdef_of_ticker ~final:true ~request_id t in
           Log.debug log_dtc "-> [%s] Sec Def Response %ld %s %s"
             addr_str request_id symbol exchange ;
-          Writer.write w (DTC.gen_security_definition_response secdef |> Piqirun.to_string)
+          write_message w `security_definition_response
+            DTC.gen_security_definition_response secdef
       end
     | _ -> ()
 
@@ -616,7 +650,8 @@ let market_data_request addr w msg =
       rej.symbol_id <- Some symbol_id ;
       rej.reject_text <- Some reject_text ;
       Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr_str reject_text;
-      Writer.write w (DTC.gen_market_data_reject rej |> Piqirun.to_string)
+      write_message w `market_data_reject
+        DTC.gen_market_data_reject rej
     end k
   in
   let req = DTC.parse_market_data_request msg in
@@ -653,7 +688,8 @@ let market_data_request addr w msg =
           String.Table.set subs symbol symbol_id;
           Log.debug log_dtc "-> [%s] Market Data Snap %ld %s %s"
             addr_str symbol_id symbol exchange ;
-          Writer.write w (DTC.gen_market_data_snapshot snap |> Piqirun.to_string)
+          write_message w `market_data_snapshot
+            DTC.gen_market_data_snapshot snap
       in
       if req.request_action = Some `unsubscribe then
         String.Table.remove subs symbol
@@ -670,7 +706,8 @@ let market_depth_request addr w msg =
       rej.reject_text <- Some reject_text ;
       Log.debug log_dtc "-> [%s] Market Depth Reject: %ld %s"
         addr_str symbol_id reject_text;
-      Writer.write w (DTC.gen_market_depth_reject rej |> Piqirun.to_string)
+      write_message w `market_depth_reject
+        DTC.gen_market_depth_reject rej
     end k
   in
   let req = DTC.parse_market_depth_request msg in
@@ -689,7 +726,8 @@ let market_depth_request addr w msg =
           snap.level <- Some lvl ;
           snap.is_first_message_in_batch <- Some (lvl = 1l) ;
           snap.is_last_message_in_batch <- Some false ;
-          Writer.write w (DTC.gen_market_depth_snapshot_level snap |> Piqirun.to_string) ;
+          write_message w `market_depth_snapshot_level
+            DTC.gen_market_depth_snapshot_level snap ;
           Int32.succ lvl
         end;
         ignore @@ Int.Map.fold ask ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
@@ -700,7 +738,8 @@ let market_depth_request addr w msg =
           snap.level <- Some lvl ;
           snap.is_first_message_in_batch <- Some (lvl = 1l && Int.Map.is_empty bid) ;
           snap.is_last_message_in_batch <- Some false ;
-          Writer.write w (DTC.gen_market_depth_snapshot_level snap |> Piqirun.to_string) ;
+          write_message w `market_depth_snapshot_level
+            DTC.gen_market_depth_snapshot_level snap ;
           Int32.succ lvl
         end;
         snap.symbol_id <- Some symbol_id ;
@@ -710,7 +749,8 @@ let market_depth_request addr w msg =
         snap.level <- None ;
         snap.is_first_message_in_batch <- Some false ;
         snap.is_last_message_in_batch <- Some true ;
-        Writer.write w (DTC.gen_market_depth_snapshot_level snap |> Piqirun.to_string) ;
+        write_message w `market_depth_snapshot_level
+          DTC.gen_market_depth_snapshot_level snap
       in
       if req.request_action = Some `unsubscribe then
         String.Table.remove subs_depth symbol
@@ -749,13 +789,13 @@ let open_orders_request addr w msg =
       resp.server_order_id <- Some (Int.to_string id) ;
       resp.exchange_order_id <- Some (Int.to_string id) ;
       resp.order_type <- Some `order_type_limit ;
-      resp.buy_sell <- Some (buy_sell side) ;
+      resp.buy_sell <- Some (buy_sell_to_dtc side) ;
       resp.price1 <- Some price ;
       resp.order_quantity <- Some amount_orig ;
       resp.filled_quantity <- Some (amount_orig -. amount) ;
       resp.remaining_quantity <- Some amount ;
       resp.time_in_force <- Some `tif_good_till_canceled ;
-      Writer.write w (DTC.gen_order_update resp |> Piqirun.to_string) ;
+      write_message w `order_update DTC.gen_order_update resp ;
       Int32.succ i
     in
     let (_:Int32.t) = Int.Table.fold orders ~init:1l ~f:send_order_update in
@@ -766,7 +806,7 @@ let open_orders_request addr w msg =
       resp.request_id <- Some request_id ;
       resp.order_update_reason <- Some `open_orders_request_response ;
       resp.no_orders <- Some true ;
-      Writer.write w (DTC.gen_order_update resp |> Piqirun.to_string)
+      write_message w `order_update DTC.gen_order_update resp
     end;
     Log.debug log_dtc "-> [%s] %d order(s)" addr_str nb_open_orders
   | _ -> ()
@@ -787,7 +827,7 @@ let current_positions_request addr w msg =
       update.exchange <- Some my_exchange ;
       update.average_price <- Some (price // 100_000_000) ;
       update.quantity <- Some (qty // 100_000_000) ;
-      Writer.write w (DTC.gen_position_update update |> Piqirun.to_string) ;
+      write_message w `position_update DTC.gen_position_update update ;
       Int32.succ msg_number
     end
   in
@@ -796,7 +836,7 @@ let current_positions_request addr w msg =
     update.message_number <- Some 1l ;
     update.request_id <- req.request_id ;
     update.no_positions <- Some true ;
-    Writer.write w (DTC.gen_position_update update |> Piqirun.to_string)
+    write_message w `position_update DTC.gen_position_update update
   end ;
   Log.debug log_dtc "-> [%s] %d positions" addr_str nb_msgs
 
@@ -810,7 +850,8 @@ let historical_order_fills addr w msg =
     resp.no_order_fills <- Some true ;
     resp.total_number_messages <- Some 1l ;
     resp.message_number <- Some 1l ;
-    Writer.write w (DTC.gen_historical_order_fill_response resp |> Piqirun.to_string)
+    write_message w `historical_order_fill_response
+      DTC.gen_historical_order_fill_response resp
   in
   let send_order_fill ?(nb_msgs=1) ~symbol msg_number
       { Rest.gid; id; ts; price; qty; fee; order_id; side; category } =
@@ -822,11 +863,12 @@ let historical_order_fills addr w msg =
     resp.symbol <- Some symbol ;
     resp.exchange <- Some my_exchange ;
     resp.server_order_id <- Some (Int.to_string gid) ;
-    resp.buy_sell <- Some (buy_sell side) ;
+    resp.buy_sell <- Some (buy_sell_to_dtc side) ;
     resp.price <- Some (price // 100_000_000) ;
     resp.quantity <- Some (qty // 100_000_000) ;
     resp.date_time <- Some (int64_of_time ts) ;
-    Writer.write w (DTC.gen_historical_order_fill_response resp |> Piqirun.to_string) ;
+    write_message w `historical_order_fill_response
+      DTC.gen_historical_order_fill_response resp ;
     Int32.succ msg_number
   in
   let nb_trades = String.Table.fold trades ~init:0 ~f:begin fun ~key:_ ~data a ->
@@ -864,7 +906,7 @@ let trade_account_request addr w msg =
     resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
     resp.message_number <- Some msg_number ;
     resp.trade_account <- Some trade_account ;
-    Writer.write w (DTC.gen_trade_account_response resp |> Piqirun.to_string) ;
+    write_message w `trade_account_response DTC.gen_trade_account_response resp ;
     Log.debug log_dtc "-> [%s] TradeAccountResponse: %s (%ld/%d)"
       addr_str trade_account msg_number nb_msgs
   end
@@ -892,7 +934,10 @@ let account_balance_request addr w msg =
     | Some account -> reject account
   end
 
-let reject_order w (req : DTC.submit_new_single_order) k =
+let reject_order
+    ~c:{ Connection.w }
+    ~(req : DTC.submit_new_single_order)
+    k =
   let update = DTC.default_order_update () in
   Printf.ksprintf begin fun info_text ->
     update.client_order_id <- req.client_order_id ;
@@ -908,11 +953,17 @@ let reject_order w (req : DTC.submit_new_single_order) k =
     update.good_till_date_time <- req.good_till_date_time ;
     update.free_form_text <- req.free_form_text ;
     update.open_or_close <- req.open_or_close ;
-    Writer.write w (DTC.gen_order_update update |> Piqirun.to_string) ;
+    write_message w `order_update DTC.gen_order_update update
   end k
 
-let send_order_update w ~(req:DTC.submit_new_single_order)
-    ~exchange_order_id ~status ~reason ~filled_qty ~remaining_qty =
+let send_order_update
+    ~c:{ Connection.w }
+    ~(req : DTC.submit_new_single_order)
+    ~exchange_order_id
+    ~status
+    ~reason
+    ~filled_qty
+    ~remaining_qty =
   let update = DTC.default_order_update () in
   update.message_number <- Some 1l ;
   update.total_num_messages <- Some 1l ;
@@ -929,184 +980,207 @@ let send_order_update w ~(req:DTC.submit_new_single_order)
   update.filled_quantity <- Some filled_qty ;
   update.remaining_quantity <- Some remaining_qty ;
   update.time_in_force <- req.time_in_force ;
-  Writer.write w (DTC.gen_order_update update |> Piqirun.to_string)
+  write_message w `order_update DTC.gen_order_update update
 
-let submit_order_api
-    ~tif
-    ~key
-    ~secret
-    ~side
-    ~symbol
-    ~price
-    ~qty
-    ~margin =
-  let tif = match tif with
-    | `tif_fill_or_kill -> Some `Fill_or_kill
-    | `tif_immediate_or_cancel -> Some `Immediate_or_cancel
-    | #DTC.time_in_force_enum -> None
+(* req argument is normalized. *)
+let submit_order_api ~c ~(req : DTC.submit_new_single_order) =
+  let { Connection.w ; key ; secret } = c in
+
+  (* OK to do this because req is normalized ************************)
+  let symbol = Option.value_exn req.symbol in
+  let side = Option.value_exn req.buy_sell |> buy_sell_of_dtc in
+  let price = Option.value_exn req.price1 in
+  let qty = Option.value_exn req.quantity in
+  (******************************************************************)
+  let margin = margin_enabled symbol in
+  let tif = match req.time_in_force with
+    | Some `tif_fill_or_kill -> Some `Fill_or_kill
+    | Some `tif_immediate_or_cancel -> Some `Immediate_or_cancel
+    | _ -> None
   in
   let order_f =
     if margin then Rest.margin_order ?max_lending_rate:None
     else Rest.order
   in
   order_f ~buf:buf_json ?tif ~key ~secret ~side ~symbol ~price ~qty () >>| function
+  | Error Rest.Http_error.Poloniex msg ->
+    reject_order ~c ~req "%s" msg
+  | Error _ ->
+    Option.iter req.client_order_id ~f:begin fun id ->
+      reject_order ~c ~req "unknown error when trying to submit %s" id
+    end
   | Ok { id; trades; amount_unfilled } -> begin
       match trades, amount_unfilled with
       | [], _ ->
-        send_order_update
+        send_order_update ~c ~req
           ~status:`order_status_open
           ~reason:`new_order_accepted
           ~exchange_order_id:id
           ~filled_qty:0.
           ~remaining_qty:qty
       | trades, 0 ->
-        send_order_update ~status:`Filled ~reason:Filled ~id ~filled_qty:m.qty ~remaining_qty:0.;
+        send_order_update ~c ~req
+          ~status:`order_status_filled
+          ~reason:`order_filled
+          ~exchange_order_id:id
+          ~filled_qty:qty
+          ~remaining_qty:0. ;
         if margin then don't_wait_for @@ Connection.update_positions c
       | trades, unfilled ->
-        let total_qty = satoshis_int_of_float_exn m.qty in
-        let filled_qty = List.fold_left trades ~init:0 ~f:(fun a { gid; id; trade } -> a + trade.qty) in
+        let total_qty = satoshis_int_of_float_exn qty in
+        let filled_qty =
+          List.fold_left trades ~init:0 ~f:(fun a { gid; id; trade } -> a + trade.qty) in
         let remaining_qty = total_qty - filled_qty in
         let filled_qty = filled_qty // 100_000_000 in
         let remaining_qty = remaining_qty // 100_000_000 in
-        send_order_update ~status:`Partially_filled ~reason:Partially_filled ~id ~filled_qty ~remaining_qty;
+        send_order_update ~c ~req
+          ~status:`order_status_partially_filled
+          ~reason:`order_filled_partially
+          ~exchange_order_id:id
+          ~filled_qty
+          ~remaining_qty ;
         if margin then don't_wait_for @@ Connection.update_positions c
     end
-  | Error Rest.Http_error.Poloniex msg ->
-    Dtc_util.Trading.Order.Submit.reject order_update_cs m "%s" msg
-  | Error _ ->
-    Dtc_util.Trading.Order.Submit.reject order_update_cs m
-      "unknown error when trying to submit %s" m.S.cli_ord_id
 
-let submit_new_single_order w (req : DTC.submit_new_single_order)
-    ~(order_type:DTC.order_type_enum)
-    ~(tif:DTC.time_in_force_enum)
-    ~symbol
-    ~exchange
-    ~price
-    ~quantity
-    ~side =
-  let tif =
-    if order_type = `order_type_market then `tif_fill_or_kill
-    else tif
-  in
-  begin match req.exchange with
-  | Some exchange when exchange = my_exchange -> ()
-  | _ ->
-    reject_order w req "Unknown exchange" ;
-    raise Exit
+let submit_new_single_order
+    ~c
+    ~(req : DTC.submit_new_single_order) =
+  req.time_in_force <- begin
+    match req.order_type with
+    | Some `order_type_market -> Some `tif_fill_or_kill
+    | _ -> req.time_in_force
   end ;
-  begin match order_type with
-    | `order_type_limit | `order_type_market -> ()
-    | #DTC.order_type_enum ->
-      reject_order w req "Unsupported order type" ;
+  begin match req.symbol, req.exchange with
+    | Some symbol, Some exchange when
+        String.Table.mem tickers symbol && exchange = my_exchange -> ()
+    | _ ->
+      reject_order ~c ~req "Unknown symbol or exchange" ;
       raise Exit
-  end;
-  begin match tif with
-    | `tif_good_till_canceled | `tif_fill_or_kill | `tif_immediate_or_cancel -> ()
+  end ;
+  begin match Option.value ~default:`tif_unset req.time_in_force with
+    | `tif_good_till_canceled
+    | `tif_fill_or_kill
+    | `tif_immediate_or_cancel -> ()
+    | `tif_day ->
+      req.time_in_force <- Some `tif_good_till_canceled
+    | `tif_unset ->
+      reject_order ~c ~req "Time in force unset" ;
+      raise Exit
     | #DTC.time_in_force_enum ->
-      reject_order w req "Poloniex does not support TIF Good till date time" ;
+      reject_order ~c ~req "Unsupported time in force" ;
       raise Exit
-  end;
-  let price = match order_type with
-    | `order_type_limit -> price
-    | `order_type_market -> begin
-        match Option.bind ~f:(String.Table.find tickers) req.symbol with
-        | None ->
-          reject_order w req "Unable to get ticker price for" ;
-          raise Exit
-        | Some (_, ticker) ->
-          satoshis_int_of_float_exn (match side with `buf -> ticker.ask | `sell -> ticker.bid)
-      end
-    | #DTC.order_type_enum -> assert false
-  in
-  let margin = margin_enabled symbol in
-  don't_wait_for (submit_order_api ~tif ~price ~margin) ;
-  Writer.write_cstruct w order_update_cs
+  end ;
+  begin match Option.value ~default:`order_type_unset req.order_type, req.price1 with
+    | `order_type_market, _ ->
+      req.price1 <- Some Float.max_value
+    | `order_type_limit, Some price ->
+      req.price1 <- Some price
+    | `order_type_limit, None ->
+      reject_order ~c ~req "Limit order without a price" ;
+      raise Exit
+    | #DTC.order_type_enum, _ ->
+      reject_order ~c ~req "Unsupported order type" ;
+      raise Exit
+  end ;
+  don't_wait_for (submit_order_api ~c ~req)
 
 let submit_new_single_order addr w msg =
+  let c = Connection.(Table.find_exn active addr) in
   let req = DTC.parse_submit_new_single_order msg in
-  let { Connection.addr_str; key; secret } as c = Connection.(Table.find_exn active addr) in
-  begin match req.symbol with
-    | Some symbol ->
-      Log.debug log_dtc "<- [%s] Submit Order %s %" addr_str (S.show m) ;
-      begin try submit_new_single_order ~symbol with
-        | Exit -> ()
-        | exn -> Log.error log_dtc "%s" @@ Exn.to_string exn
-      end
-    | _ -> ()
-  end
+  Log.debug log_dtc "<- [%s] Submit New Single Order" c.Connection.addr_str ;
+  try submit_new_single_order ~c ~req with
+  | Exit -> ()
+  | exn -> Log.error log_dtc "%s" @@ Exn.to_string exn
+
+let reject_cancel_order
+    ~c:{ Connection.w }
+    ~(req : DTC.cancel_order)
+    k =
+  let update = DTC.default_order_update () in
+  Printf.ksprintf begin fun info_text ->
+    update.message_number <- Some 1l ;
+    update.total_num_messages <- Some 1l ;
+    update.client_order_id <- req.client_order_id ;
+    update.server_order_id <- req.server_order_id ;
+    update.order_status <- Some `order_status_open ;
+    update.order_update_reason <- Some `order_cancel_rejected ;
+    update.info_text <- Some info_text ;
+    write_message w `order_update DTC.gen_order_update update
+  end k
 
 let cancel_order addr w msg =
-    let open Trading.Order in
-    let reject m k =
-      let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-      Printf.ksprintf begin fun reason ->
-        Update.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~status:`Open
-          ~reason:Cancel_rejected
-          ~cli_ord_id:m.Cancel.cli_ord_id
-          ~srv_ord_id:m.srv_ord_id
-          ~info_text:reason
-          order_update_cs;
-        Writer.write_cstruct w order_update_cs;
-        Log.debug log_dtc "-> [%s] Reject (%s)" addr_str reason
-      end k
-    in
-    let m = Cancel.read msg_cs in
-    let { Connection.addr_str; key; secret } = Connection.(Table.find_exn active addr) in
-    Log.debug log_dtc "<- [%s] Order Cancel cli=%s srv=%s" addr_str m.cli_ord_id m.srv_ord_id;
-    don't_wait_for @@ begin
-      Rest.cancel ~key ~secret Int.(of_string m.srv_ord_id) >>| function
-      | Error Rest.Http_error.Poloniex msg -> reject m "%s" msg
-      | Error _ ->
-        reject m "exception raised while trying to cancel cli=%s srv=%s"
-          m.cli_ord_id m.srv_ord_id
-      | Ok () -> ()
-    end
+    let ({ Connection.addr_str; key; secret } as c) = Connection.(Table.find_exn active addr) in
+    let req = DTC.parse_cancel_order msg in
+    match req.server_order_id with
+    | None ->
+      reject_cancel_order ~c ~req "Server order id not set"
+    | Some server_order_id ->
+      Log.debug log_dtc "<- [%s] Order Cancel %s" addr_str server_order_id;
+      don't_wait_for begin
+        Rest.cancel ~key ~secret Int.(of_string server_order_id) >>| function
+        | Error Rest.Http_error.Poloniex msg ->
+          reject_cancel_order ~c ~req "%s" msg
+        | Error _ ->
+          reject_cancel_order ~c ~req
+            "exception raised while trying to cancel %s" server_order_id
+        | Ok () -> ()
+      end
+
+let reject_cancel_replace_order
+    ~c:{ Connection.w ; addr_str }
+    ~(req : DTC.cancel_replace_order)
+    k =
+  let price1 =
+    if Option.value ~default:false req.price1_is_set then req.price1 else None in
+  let price2 =
+    if Option.value ~default:false req.price2_is_set then req.price2 else None in
+  let update = DTC.default_order_update () in
+  Printf.ksprintf begin fun info_text ->
+    Log.debug log_dtc "-> [%s] Cancel Replace Reject: %s" addr_str info_text ;
+    update.client_order_id <- req.client_order_id ;
+    update.server_order_id <- req.server_order_id ;
+    update.order_status <- Some `order_status_open ;
+    update.order_update_reason <- Some `order_cancel_replace_rejected ;
+    update.info_text <- Some info_text ;
+    update.message_number <- Some 1l ;
+    update.total_num_messages <- Some 1l ;
+    update.exchange <- Some my_exchange ;
+    update.price1 <- price1 ;
+    update.price2 <- price2 ;
+    update.order_quantity <- req.quantity ;
+    update.time_in_force <- req.time_in_force ;
+    update.good_till_date_time <- req.good_till_date_time ;
+    write_message w `order_update DTC.gen_order_update update
+  end k
 
 let cancel_replace_order addr w msg =
-    let open Trading.Order in
-    let reject m k =
-      let order_update_cs = Cstruct.of_bigarray ~off:0 ~len:Update.sizeof_cs scratchbuf in
-      Printf.ksprintf begin fun reason ->
-        Update.write
-          ~nb_msgs:1
-          ~msg_number:1
-          ~reason:Cancel_replace_rejected
-          ~cli_ord_id:m.Replace.cli_ord_id
-          ~srv_ord_id:m.srv_ord_id
-          ?ord_type:m.Replace.ord_type
-          ~p1:m.Replace.p1
-          ~p2:m.Replace.p2
-          ~order_qty:m.Replace.qty
-          ?tif:m.Replace.tif
-          ~good_till_ts:m.Replace.good_till_ts
-          ~info_text:reason
-          order_update_cs;
-        Writer.write_cstruct w order_update_cs;
-        Log.debug log_dtc "-> [%s] CancelReplaceRej: %s" addr_str reason
-      end k
-    in
-    let m = Replace.read msg_cs in
-    let { Connection.addr_str; key; secret } = Connection.(Table.find_exn active addr) in
-    Log.debug log_dtc "<- [%s] %s" addr_str (Replace.show m);
-    if Option.is_some m.Replace.ord_type then
-      reject m "Modification of order type is not supported by Poloniex"
-    else if Option.is_some m.Replace.tif then
-      reject m "Modification of time in force is not supported by Poloniex"
-    else
-    don't_wait_for @@ begin
-      let id = Int.of_string m.srv_ord_id in
-      Rest.cancel ~buf:buf_json ~key ~secret id >>| function
-      | Error Rest.Http_error.Poloniex msg ->
-        reject m "cancel order %s failed: %s" m.srv_ord_id msg
-      | Error _ -> reject m "cancel order %s failed" m.srv_ord_id
-      | Ok () -> () (* TODO: send order update *)
-    end
-
-
+  let c = Connection.(Table.find_exn active addr) in
+  let req = DTC.parse_cancel_replace_order msg in
+  Log.debug log_dtc "<- [%s] Cancel Replace Order" c.addr_str ;
+  if Option.is_some req.order_type then
+    reject_cancel_replace_order ~c ~req
+      "Modification of order type is not supported by Poloniex"
+  else if Option.is_some req.time_in_force then
+    reject_cancel_replace_order ~c ~req
+      "Modification of time in force is not supported by Poloniex"
+  else
+    match req.server_order_id, req.price1 with
+    | None, _ ->
+      reject_cancel_replace_order ~c ~req "Server order id is not set"
+    | _, None ->
+      reject_cancel_replace_order ~c ~req
+        "Order modify without setting a price is not supported by Poloniex"
+    | Some id, Some price ->
+      don't_wait_for begin
+        let id = Int.of_string id in
+        Rest.modify ?qty:req.quantity ~key:c.key ~secret:c.secret ~price id >>| function
+        | Error Rest.Http_error.Poloniex msg ->
+          reject_cancel_replace_order ~c ~req "cancel order %d failed: %s" id msg
+        | Error _ ->
+          reject_cancel_replace_order ~c ~req "cancel order %d failed" id
+        | Ok _ ->
+          () (* TODO: send order update *)
+      end
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
@@ -1118,14 +1192,33 @@ let dtcserver ~server ~port =
         Log.debug log_dtc "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen;
         if len < msglen then return @@ `Consumed (consumed, `Need msglen)
         else begin
-          let msgtype = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
-          let msgtype = DTC.parse_dtcmessage_type (Piqirun.Varint msgtype) in
+          let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
+          let msgtype : DTC.dtcmessage_type =
+            DTC.parse_dtcmessage_type (Piqirun.Varint msgtype_int) in
           let msg_str = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
           let msg = Piqirun.init_from_string msg_str in
           begin match msgtype with
-            | `encoding_request -> encoding_request addr w msg
+            | `encoding_request ->
+              begin match (Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
+                | None -> Log.error log_dtc "Invalid encoding request received"
+                | Some msg -> encoding_request addr w msg
+              end
+            | `logon_request -> logon_request addr w msg
+            | `heartbeat -> heartbeat addr w msg
+            | `security_definition_for_symbol_request -> security_definition_request addr w msg
+            | `market_data_request -> market_data_request addr w msg
+            | `market_depth_request -> market_depth_request addr w msg
+            | `open_orders_request -> open_orders_request addr w msg
+            | `current_positions_request -> current_positions_request addr w msg
+            | `historical_order_fills_request -> historical_order_fills addr w msg
+            | `trade_accounts_request -> trade_account_request addr w msg
+            | `account_balance_request -> account_balance_request addr w msg
+            | `submit_new_single_order -> submit_new_single_order addr w msg
+            | `cancel_order -> cancel_order addr w msg
+            | `cancel_replace_order -> cancel_replace_order addr w msg
             | #DTC.dtcmessage_type ->
               let msg_hex = Hex.(hexdump_s (of_string msg_str)) in
+              Log.error log_dtc "Unknown msg type %d" msgtype_int ;
               Log.error log_dtc "%s" msg_hex
           end ;
           handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
@@ -1154,7 +1247,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let main update_client_span' heartbeat wait_for_pong tls port daemon sockfile pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path () =
+let main update_client_span' heartbeat wait_for_pong tls port daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path () =
   update_client_span := Time_ns.Span.of_string update_client_span';
   let heartbeat = Option.map heartbeat ~f:Time_ns.Span.of_string in
   let wait_for_pong = Option.map wait_for_pong ~f:Time_ns.Span.of_string in
@@ -1164,7 +1257,6 @@ let main update_client_span' heartbeat wait_for_pong tls port daemon sockfile pi
     Tcp.Server.close_finished dtc_server
   in
 
-  plnx_historical := sockfile;
   Log.set_level log_dtc @@ loglevel_of_int @@ max loglevel ll_dtc;
   Log.set_level log_plnx @@ loglevel_of_int @@ max loglevel ll_plnx;
 
@@ -1177,14 +1269,12 @@ let main update_client_span' heartbeat wait_for_pong tls port daemon sockfile pi
 
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
-    | Error err ->
-      failwith "Unable to fetch currencies from Poloniex"
+    | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
     | Ok currs ->
       List.iter currs ~f:(fun (c, t) -> String.Table.set currencies c t)
     end >>= fun () ->
     Rest.tickers () >>| begin function
-    | Error _ ->
-      failwith "Unable to fetch tickers from Poloniex"
+    | Error err -> failwithf "tickers: %s" (Rest.Http_error.to_string err) ()
     | Ok ts ->
       List.iter ts ~f:(fun t -> String.Table.set tickers t.symbol (now, t))
     end >>= fun () ->
@@ -1203,12 +1293,11 @@ let command =
     +> flag "-heartbeat" (optional string) ~doc:" Heartbeat period (default: 25s)"
     +> flag "-wait-for-pong" (optional string) ~doc:" max PONG waiting time (default: 5s)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
-    +> flag "-port" (optional_with_default 5571 int) ~doc:"int TCP port to use (5571)"
+    +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
-    +> flag "-sockfile" (optional_with_default "run/plnx.sock" string) ~doc:"filename UNIX sock to use (run/plnx.sock)"
     +> flag "-pidfile" (optional_with_default "run/plnx.pid" string) ~doc:"filename Path of the pid file (run/plnx.pid)"
     +> flag "-logfile" (optional_with_default "log/plnx.log" string) ~doc:"filename Path of the log file (log/plnx.log)"
-    +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 loglevel for DTC"
+    +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 global loglevel"
     +> flag "-loglevel-dtc" (optional_with_default 2 int) ~doc:"1-3 loglevel for DTC"
     +> flag "-loglevel-plnx" (optional_with_default 2 int) ~doc:"1-3 loglevel for PLNX"
     +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
