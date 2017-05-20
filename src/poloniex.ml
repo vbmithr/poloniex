@@ -40,6 +40,7 @@ let my_exchange = "PLNX"
 let exchange_account = "exchange"
 let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 10
+let sc_mode = ref false
 
 let log_plnx =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
@@ -84,7 +85,11 @@ let descr_of_symbol s =
     Buffer.contents buf
   | _ -> invalid_argf "descr_of_symbol: %s" s ()
 
-let secdef_of_ticker ?(request_id=0l) ?(final=true) t =
+let secdef_of_ticker ?request_id ?(final=true) t =
+  let request_id = match request_id with
+    | Some reqid -> reqid
+    | None when !sc_mode -> 110_000_000l
+    | None -> 0l in
   let secdef = DTC.default_security_definition_response () in
   secdef.request_id <- Some request_id ;
   secdef.is_final_message <- Some final ;
@@ -587,7 +592,7 @@ let logon_request addr w msg =
     write_message w `logon_response
       DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
     Log.debug log_dtc "-> [%s] Logon Response (%s)" addr_str result_text ;
-    begin
+    if not !sc_mode || send_secdefs then begin
       String.Table.iter tickers ~f:begin fun (ts, t) ->
         let secdef = secdef_of_ticker ~final:true t in
         write_message w `security_definition_response
@@ -1256,7 +1261,9 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let main update_client_span' heartbeat wait_for_pong tls port daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path () =
+let main update_client_span' heartbeat wait_for_pong tls port
+    daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
+  sc_mode := sc ;
   update_client_span := Time_ns.Span.of_string update_client_span';
   let heartbeat = Option.map heartbeat ~f:Time_ns.Span.of_string in
   let wait_for_pong = Option.map wait_for_pong ~f:Time_ns.Span.of_string in
@@ -1311,6 +1318,7 @@ let command =
     +> flag "-loglevel-plnx" (optional_with_default 2 int) ~doc:"1-3 loglevel for PLNX"
     +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
     +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
+    +> flag "-sc" no_arg ~doc:" Sierra Chart mode."
   in
   Command.Staged.async ~summary:"Poloniex bridge" spec main
 
