@@ -1,5 +1,5 @@
-(executables
- ((names (poloniex))
-  (public_names (poloniex))
+(executable
+ ((name poloniex)
+  (public_name poloniex)
   (preprocess (pps (ppx_sexp_conv)))
-  (libraries (uuidm ezjsonm ocplib-json-typed tick dtc-pb bs-api leveldb))))
+  (libraries (dtc-pb bs-api))))
