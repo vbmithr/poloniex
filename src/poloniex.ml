@@ -2,7 +2,9 @@ open Core
 open Async
 
 open Bs_devkit
-open Bs_api.PLNX
+open Plnx
+module Rest = Plnx_rest
+module Ws = Plnx_ws
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
@@ -106,33 +108,6 @@ let secdef_of_ticker ?request_id ?(final=true) t =
 let books : Book.t String.Table.t = String.Table.create ()
 let latest_trades : DB.trade String.Table.t = String.Table.create ()
 
-module TradeHistory = struct
-  module T = struct
-    type t = Rest.trade_history [@@deriving sexp]
-    let compare t t' = Int.compare t.Rest.id t'.Rest.id
-  end
-  include T
-  module Set = Set.Make(T)
-end
-
-module OpenOrders = struct
-  module T = struct
-    type t = Rest.open_orders_resp [@@deriving sexp]
-    let compare (t:t) (t':t) = Int.compare t.Rest.id t'.Rest.id
-  end
-  include T
-  module Set = Set.Make(T)
-end
-
-module MarginPosition = struct
-  module T = struct
-    type t = { symbol: string; p: Rest.margin_position } [@@deriving sexp]
-    let compare (t:t) (t':t) = String.compare t.symbol t'.symbol
-  end
-  include T
-  module Set = Set.Make(T)
-end
-
 module Connection = struct
   type t = {
     addr: Socket.Address.Inet.t;
@@ -148,9 +123,9 @@ module Connection = struct
     b_margin: Int.t String.Table.t;
     mutable margin: Rest.margin_account_summary;
     (* Orders & Trades *)
-    orders: (string * Rest.open_orders_resp) Int.Table.t;
-    trades: TradeHistory.Set.t String.Table.t;
-    mutable positions: MarginPosition.Set.t;
+    orders: (string * Rest.OpenOrders.t) Int.Table.t;
+    trades: Rest.TradeHistory.Set.t String.Table.t;
+    mutable positions: Rest.MarginPosition.Set.t;
     send_secdefs : bool ;
   }
 
@@ -175,16 +150,17 @@ module Connection = struct
       Log.error log_plnx "update positions (%s): %s"
         addr_str @@ Rest.Http_error.to_string err
     | Ok ps ->
-      let cur_pos = MarginPosition.Set.of_list @@
-        List.filter_map ps ~f:begin function
-        | _, None -> None
-        | symbol, Some p -> Some { MarginPosition.symbol; p }
+      let cur_pos = List.filter_map ps ~f:begin function
+          | _, None -> None
+          | symbol, Some position ->
+            Some (Rest.MarginPosition.create ~symbol ~position)
         end in
-      let new_pos = MarginPosition.Set.diff cur_pos positions in
-      let old_pos = MarginPosition.Set.diff positions cur_pos in
+      let cur_pos = Rest.MarginPosition.Set.of_list cur_pos in
+      let new_pos = Rest.MarginPosition.Set.diff cur_pos positions in
+      let old_pos = Rest.MarginPosition.Set.diff positions cur_pos in
       c.positions <- cur_pos;
-      MarginPosition.Set.iter old_pos ~f:(fun { symbol } -> write_update symbol);
-      MarginPosition.Set.iter new_pos ~f:begin fun { symbol; p={ price; qty } } ->
+      Rest.MarginPosition.Set.iter old_pos ~f:(fun { symbol } -> write_update symbol);
+      Rest.MarginPosition.Set.iter new_pos ~f:begin fun { symbol; position = { price; qty } } ->
         write_update ~price ~qty symbol
       end
 
