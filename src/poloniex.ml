@@ -125,7 +125,7 @@ module Connection = struct
     (* Orders & Trades *)
     orders: (string * Rest.OpenOrders.t) Int.Table.t;
     trades: Rest.TradeHistory.Set.t String.Table.t;
-    mutable positions: Rest.MarginPosition.Set.t;
+    positions: Rest.MarginPosition.t String.Table.t;
     send_secdefs : bool ;
   }
 
@@ -133,7 +133,7 @@ module Connection = struct
 
   let active : t Table.t = Table.create ()
 
-  let update_positions ({ addr_str; w; key; secret; positions } as c) =
+  let update_positions { addr_str; w; key; secret; positions } =
     let write_update ?(price=0.) ?(qty=0.) symbol =
       let update = DTC.default_position_update () in
       update.trade_account <- Some margin_account ;
@@ -143,23 +143,21 @@ module Connection = struct
       update.exchange <- Some my_exchange ;
       update.quantity <- Some qty ;
       update.average_price <- Some price ;
+      update.unsolicited <- Some true ;
       write_message w `position_update DTC.gen_position_update update
     in
     Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
       Log.error log_plnx "update positions (%s): %s"
         addr_str @@ Rest.Http_error.to_string err
-    | Ok ps ->
-      let cur_pos = List.map ps ~f:begin fun (symbol, position) ->
-          Rest.MarginPosition.create ~symbol ~position
-        end in
-      let cur_pos = Rest.MarginPosition.Set.of_list cur_pos in
-      let new_pos = Rest.MarginPosition.Set.diff cur_pos positions in
-      let old_pos = Rest.MarginPosition.Set.diff positions cur_pos in
-      c.positions <- cur_pos;
-      Rest.MarginPosition.Set.iter old_pos ~f:(fun { symbol } -> write_update symbol);
-      Rest.MarginPosition.Set.iter new_pos ~f:begin fun { symbol; position = { price; qty } } ->
-        write_update ~price ~qty symbol
+    | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
+        match p with
+        | None ->
+          String.Table.remove positions symbol ;
+          write_update symbol
+        | Some ({ price; qty; total; pl; lending_fees; side } as p) ->
+          String.Table.set positions ~key:symbol ~data:p ;
+          write_update ~price ~qty symbol
       end
 
   let update_orders { addr_str; key; secret; orders } =
@@ -302,7 +300,7 @@ module Connection = struct
       margin = Rest.MarginAccountSummary.empty ;
       orders = Int.Table.create () ;
       trades = String.Table.create () ;
-      positions = Rest.MarginPosition.Set.empty ;
+      positions = String.Table.create () ;
     } in
     Table.set active ~key:addr ~data:conn;
     if key = "" || secret_str = "" then Deferred.return false
@@ -802,12 +800,12 @@ let open_orders_request addr w msg =
 let current_positions_request addr w msg =
   let { Connection.addr_str; positions } = Connection.(Table.find_exn active addr) in
   Log.debug log_dtc "<- [%s] Positions" addr_str;
-  let nb_msgs = Rest.MarginPosition.Set.length positions in
+  let nb_msgs = String.Table.length positions in
   let req = DTC.parse_current_positions_request msg in
   let update = DTC.default_position_update () in
   let (_:Int32.t) =
-    Rest.MarginPosition.Set.fold positions
-      ~init:1l ~f:begin fun msg_number { Rest.MarginPosition.symbol; position = { price; qty } } ->
+    String.Table.fold positions
+      ~init:1l ~f:begin fun ~key:symbol ~data:{ price; qty } msg_number ->
       update.trade_account <- Some margin_account ;
       update.total_number_messages <- Int32.of_int nb_msgs ;
       update.message_number <- Some msg_number ;
