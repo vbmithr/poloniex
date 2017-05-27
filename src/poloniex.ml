@@ -503,9 +503,13 @@ let ws ?heartbeat ?wait_for_pong () =
       end
     | msg -> Log.error log_plnx "unknown message"
   in
-  let disc_r, disconnected = Pipe.create () in
-  don't_wait_for @@
-  Pipe.iter_without_pushback disc_r ~f:(fun () -> String.Table.clear books) ;
+  let disconnected = Condition.create () in
+  let rec clear_books () =
+    Condition.wait disconnected >>= fun () ->
+    String.Table.clear books ;
+    clear_books ()
+  in
+  don't_wait_for (clear_books ()) ;
   let ws = Ws.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
