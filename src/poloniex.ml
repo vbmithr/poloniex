@@ -622,58 +622,71 @@ let security_definition_request addr w msg =
       end
     | _ -> ()
 
+
+let reject_market_data_request ?symbol_id addr w k =
+  Printf.ksprintf begin fun reject_text ->
+    let rej = DTC.default_market_data_reject () in
+    rej.symbol_id <- symbol_id ;
+    rej.reject_text <- Some reject_text ;
+    Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr reject_text;
+    write_message w `market_data_reject
+      DTC.gen_market_data_reject rej
+  end k
+
+let gen_market_data_snap symbol_id symbol exchange addr w =
+  Option.map (String.Table.find tickers symbol) ~f:begin fun (ts, t) ->
+    let snap = DTC.default_market_data_snapshot () in
+    snap.symbol_id <- Some symbol_id ;
+    snap.session_high_price <- Some t.high24h ;
+    snap.session_low_price <- Some t.low24h ;
+    snap.session_volume <- Some t.base_volume ;
+    snap.last_trade_price <- Some t.last ;
+    snap.bid_ask_date_time <- Some (float_of_time ts) ;
+    begin match String.Table.find books symbol with
+    | None -> ()
+    | Some { bid ; ask } ->
+      begin match Float.Map.max_elt bid with
+        | None -> ()
+        | Some (bbp, bbq) ->
+          snap.bid_price <- Some bbp ;
+          snap.bid_quantity <- Some bbq
+      end ;
+      begin match Float.Map.min_elt ask with
+        | None -> ()
+        | Some (bap, baq) ->
+          snap.ask_price <- Some bap ;
+          snap.ask_quantity <- Some baq
+      end
+    end ;
+    snap
+  end
+
 let market_data_request addr w msg =
-  let reject addr_str w symbol_id k = Printf.ksprintf begin fun reject_text ->
-      let rej = DTC.default_market_data_reject () in
-      rej.symbol_id <- Some symbol_id ;
-      rej.reject_text <- Some reject_text ;
-      Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr_str reject_text;
-      write_message w `market_data_reject
-        DTC.gen_market_data_reject rej
-    end k
-  in
   let req = DTC.parse_market_data_request msg in
   match req.symbol_id, req.symbol, req.exchange with
-    | Some symbol_id, Some symbol, Some exchange ->
-      let { Connection.addr; subs; _ } =
-        String.Table.find_exn Connection.active addr in
-      Log.debug log_dtc "<- [%s] Market Data Req %ld %s %s"
-        addr symbol_id symbol exchange ;
-      let accept () =
-        let snap =
-          let open Option.Monad_infix in
-          String.Table.find tickers symbol >>= fun (ticker_ts, t) ->
-          let books = String.Table.find books symbol in
-          books >>= fun { bid } -> Float.Map.max_elt bid >>= fun (bbp, bbq) ->
-          books >>= fun { ask } -> Float.Map.min_elt ask >>| fun (bap, baq) ->
-          let snap = DTC.default_market_data_snapshot () in
-          snap.symbol_id <- Some symbol_id ;
-          snap.session_high_price <- Some t.high24h ;
-          snap.session_low_price <- Some t.low24h ;
-          snap.session_volume <- Some t.base_volume ;
-          snap.bid_price <- Some bbp ;
-          snap.bid_quantity <- Some bbq ;
-          snap.ask_price <- Some bap ;
-          snap.ask_quantity <- Some baq ;
-          snap.last_trade_price <- Some t.last ;
-          snap.bid_ask_date_time <- Some (float_of_time ticker_ts) ;
-          snap
-        in
-        match snap with
-        | None -> reject addr w symbol_id "No such symbol %s" symbol
-        | Some snap ->
-          String.Table.set subs symbol symbol_id;
-          Log.debug log_dtc "-> [%s] Market Data Snap %ld %s %s"
-            addr symbol_id symbol exchange ;
-          write_message w `market_data_snapshot
-            DTC.gen_market_data_snapshot snap
-      in
-      if req.request_action = Some `unsubscribe then
-        String.Table.remove subs symbol
-      else if exchange <> my_exchange then
-        reject addr w symbol_id "No such exchange %s" exchange
-      else accept ()
-    | _ -> ()
+  | Some symbol_id, Some symbol, Some exchange ->
+    let { Connection.addr; subs; _ } =
+      String.Table.find_exn Connection.active addr in
+    Log.debug log_dtc "<- [%s] Market Data Req %ld %s %s"
+      addr symbol_id symbol exchange ;
+    if req.request_action = Some `unsubscribe then
+      String.Table.remove subs symbol
+    else if exchange <> my_exchange then
+      reject_market_data_request addr w ~symbol_id "No such exchange %s" exchange
+    else begin
+      match gen_market_data_snap symbol_id symbol exchange addr w with
+      | None ->
+        reject_market_data_request addr w ~symbol_id "No such symbol %s" symbol
+      | Some snap ->
+        String.Table.set subs symbol symbol_id;
+        Log.debug log_dtc "-> [%s] Market Data Snap %ld %s %s"
+          addr symbol_id symbol exchange ;
+        write_message w `market_data_snapshot
+          DTC.gen_market_data_snapshot snap
+    end
+  | _ ->
+    reject_market_data_request addr w
+      "Market Data Request: no symbol id, symbol or exchange provided"
 
 let market_depth_accept
     ~conn:{ Connection.addr ; w ; subs_depth }
@@ -719,7 +732,7 @@ let market_depth_accept
   snap.is_last_message_in_batch <- Some true ;
   write_message w `market_depth_snapshot_level
     DTC.gen_market_depth_snapshot_level snap ;
-  Log.debug log_dtc "-> [%s] Market Depth Snapshot %s-%s (%d/%d)"
+  Log.debug log_dtc "-> [%s] Market Depth Snapshot %s %s (%d/%d)"
     addr symbol exchange (Float.Map.length bid) (Float.Map.length ask)
 
 let market_depth_request addr w msg =
@@ -738,7 +751,7 @@ let market_depth_request addr w msg =
     String.Table.find_exn Connection.active addr in
   match req.symbol_id, req.symbol, req.exchange with
     | Some symbol_id, Some symbol, Some exchange ->
-      Log.debug log_dtc "<- [%s] Market Depth Request %s-%s" addr symbol exchange ;
+      Log.debug log_dtc "<- [%s] Market Depth Request %s %s" addr symbol exchange ;
       if req.request_action = Some `unsubscribe then
         String.Table.remove subs_depth symbol
       else if exchange <> my_exchange then
@@ -747,7 +760,7 @@ let market_depth_request addr w msg =
         reject w symbol_id "No such symbol %s" symbol
       else begin match String.Table.find books symbol with
         | None ->
-          reject w symbol_id "No orderbook for %s-%s" symbol exchange
+          reject w symbol_id "No orderbook for %s %s" symbol exchange
         | Some books -> market_depth_accept ~conn ~req ~books
       end
     | _ -> ()
