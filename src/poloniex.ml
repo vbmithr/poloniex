@@ -403,7 +403,7 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
       write_message w `market_data_update_trade
         DTC.gen_market_data_update_trade update ;
       Log.debug log_dtc "-> [%s] %s T %s"
-        addr pair (Format.asprintf "%a" Sexplib.Sexp.pp_hum (Trade.sexp_of_t t));
+        addr pair (Format.asprintf "%a" Sexplib.Sexp.pp (Trade.sexp_of_t t));
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
@@ -433,7 +433,7 @@ let on_book_updates pair ts updates =
   book.ask <- ask;
   let send_depth_updates addr_str w symbol_id u =
     Log.debug log_dtc "-> [%s] %s D %s"
-      addr_str pair (Format.asprintf "%a" Sexplib.Sexp.pp_hum (Plnx.Book.sexp_of_entry u));
+      addr_str pair (Format.asprintf "%a" Sexplib.Sexp.pp (Plnx.Book.sexp_of_entry u));
     let update_type = if u.qty = 0. then `market_depth_delete_level else
         `market_depth_insert_update_level in
     let update = DTC.default_market_depth_update_level () in
