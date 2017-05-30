@@ -112,7 +112,7 @@ module Connection = struct
     addr: string;
     w: Writer.t;
     key: string;
-    secret: Cstruct.t;
+    secret: string;
     mutable dropped: int;
     subs: Int32.t String.Table.t;
     subs_depth: Int32.t String.Table.t;
@@ -279,8 +279,7 @@ module Connection = struct
     update_balances_loop conn span
       ~start:Clock_ns.(after @@ Time_ns.Span.of_int_ms 1000)
 
-  let setup ~addr ~w ~key ~secret:secret_str ~send_secdefs =
-    let secret = Cstruct.of_string secret_str in
+  let setup ~addr ~w ~key ~secret ~send_secdefs =
     let conn = {
       addr ;
       w ;
@@ -298,7 +297,7 @@ module Connection = struct
       positions = String.Table.create () ;
     } in
     String.Table.set active ~key:addr ~data:conn;
-    if key = "" || secret_str = "" then Deferred.return false
+    if key = "" || secret = "" then Deferred.return false
     else begin
       Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
       | Error _ -> false
@@ -1219,9 +1218,7 @@ let dtcserver ~server ~port =
             | `cancel_order -> cancel_order addr w msg
             | `cancel_replace_order -> cancel_replace_order addr w msg
             | #DTC.dtcmessage_type ->
-              let msg_hex = Hex.(hexdump_s (of_string msg_str)) in
-              Log.error log_dtc "Unknown msg type %d" msgtype_int ;
-              Log.error log_dtc "%s" msg_hex
+              Log.error log_dtc "Unknown msg type %d" msgtype_int
           end ;
           handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
         end
