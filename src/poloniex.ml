@@ -48,24 +48,15 @@ let log_plnx =
 let log_dtc =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
-module Book = struct
-  type t = {
-    mutable bid: Float.t Float.Map.t ;
-    mutable ask: Float.t Float.Map.t ;
-  }
-
-  let create () = {
-    bid = Float.Map.empty ;
-    ask = Float.Map.empty ;
-  }
-end
-
 let reqid_to_sym : String.t Int.Table.t = Int.Table.create ()
 let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
 let sym_to_subid : Int.t String.Table.t = String.Table.create ()
 
 let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
+let bids : Float.t Float.Map.t String.Table.t = String.Table.create ()
+let asks : Float.t Float.Map.t String.Table.t = String.Table.create ()
+let latest_trades : Trade.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
 
@@ -104,8 +95,6 @@ let secdef_of_ticker ?request_id ?(final=true) t =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
-let books : Book.t String.Table.t = String.Table.create ()
-let latest_trades : Trade.t String.Table.t = String.Table.create ()
 
 module Connection = struct
   type t = {
@@ -409,27 +398,22 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
   String.Table.iter Connection.active ~f:on_connection
 
 let on_book_updates pair ts updates =
-  let book = String.Table.find_or_add books pair ~default:Book.create in
-  let fold_updates { Book.bid; ask } { Plnx.Book.side; price; qty } =
+  let bid = String.Table.find_or_add bids pair ~default:(fun () -> Float.Map.empty) in
+  let ask = String.Table.find_or_add asks pair ~default:(fun () -> Float.Map.empty) in
+  let fold_updates (bid, ask) { Plnx.Book.side; price; qty } =
     match side with
-    | `Buy -> {
-        Book.bid = begin
-          if qty > 0. then Float.Map.add bid ~key:price ~data:qty
-          else Float.Map.remove bid price
-        end;
-        ask;
-      }
-    | `Sell -> {
-        Book.ask = begin
-          if qty > 0. then Float.Map.add ask ~key:price ~data:qty
-          else Float.Map.remove ask price
-        end;
-        bid;
-      }
+    | `Buy ->
+      (if qty > 0. then Float.Map.add bid ~key:price ~data:qty
+       else Float.Map.remove bid price),
+      ask
+    | `Sell ->
+        (if qty > 0. then Float.Map.add ask ~key:price ~data:qty
+         else Float.Map.remove ask price),
+        bid
   in
-  let { Book.bid; ask } =  List.fold_left ~init:book updates ~f:fold_updates in
-  book.bid <- bid;
-  book.ask <- ask;
+  let bid, ask = List.fold_left ~init:(bid, ask) updates ~f:fold_updates in
+  String.Table.set bids pair bid ;
+  String.Table.set asks pair ask ;
   let send_depth_updates addr_str w symbol_id u =
     Log.debug log_dtc "-> [%s] %s D %s"
       addr_str pair (Format.asprintf "%a" Sexplib.Sexp.pp (Plnx.Book.sexp_of_entry u));
@@ -501,7 +485,8 @@ let ws ?heartbeat ?wait_for_pong () =
   let disconnected = Condition.create () in
   let rec clear_books () =
     Condition.wait disconnected >>= fun () ->
-    String.Table.clear books ;
+    String.Table.clear bids ;
+    String.Table.clear asks ;
     clear_books ()
   in
   don't_wait_for (clear_books ()) ;
@@ -641,21 +626,21 @@ let gen_market_data_snap symbol_id symbol exchange addr w =
     snap.session_volume <- Some t.base_volume ;
     snap.last_trade_price <- Some t.last ;
     snap.bid_ask_date_time <- Some (float_of_time ts) ;
-    begin match String.Table.find books symbol with
-    | None -> ()
-    | Some { bid ; ask } ->
-      begin match Float.Map.max_elt bid with
-        | None -> ()
-        | Some (bbp, bbq) ->
-          snap.bid_price <- Some bbp ;
-          snap.bid_quantity <- Some bbq
-      end ;
-      begin match Float.Map.min_elt ask with
-        | None -> ()
-        | Some (bap, baq) ->
-          snap.ask_price <- Some bap ;
-          snap.ask_quantity <- Some baq
-      end
+    begin match String.Table.(find bids symbol, find asks symbol) with
+      | Some bid, Some ask  ->
+        begin match Float.Map.max_elt bid with
+          | None -> ()
+          | Some (bbp, bbq) ->
+            snap.bid_price <- Some bbp ;
+            snap.bid_quantity <- Some bbq
+        end ;
+        begin match Float.Map.min_elt ask with
+          | None -> ()
+          | Some (bap, baq) ->
+            snap.ask_price <- Some bap ;
+            snap.ask_quantity <- Some baq
+        end
+      | _ -> ()
     end ;
     snap
   end
@@ -690,7 +675,7 @@ let market_data_request addr w msg =
 let market_depth_accept
     ~conn:{ Connection.addr ; w ; subs_depth }
     ~req
-    ~books:{ Book.bid ; ask } =
+    ~bid ~ask =
   (* OK because we sanitize before *******************************************)
   let symbol_id = Option.value_exn req.DTC.Market_depth_request.symbol_id in
   let symbol = Option.value_exn req.DTC.Market_depth_request.symbol in
@@ -757,10 +742,11 @@ let market_depth_request addr w msg =
         reject w symbol_id "No such exchange %s" exchange
       else if not String.Table.(mem tickers symbol) then
         reject w symbol_id "No such symbol %s" symbol
-      else begin match String.Table.find books symbol with
-        | None ->
+      else begin match String.Table.(find bids symbol, find asks symbol) with
+        | Some bid, Some ask ->
+          market_depth_accept ~conn ~req ~bid ~ask
+        | _ ->
           reject w symbol_id "No orderbook for %s %s" symbol exchange
-        | Some books -> market_depth_accept ~conn ~req ~books
       end
     | _ -> ()
 
