@@ -412,13 +412,15 @@ let on_book_updates pair ts updates =
   let bid, ask = List.fold_left ~init:(bid, ask) updates ~f:fold_updates in
   String.Table.set bids pair bid ;
   String.Table.set asks pair ask ;
-  let send_depth_updates addr_str w symbol_id u =
+  let send_depth_updates
+      (update : DTC.Market_depth_update_level.t)
+      addr_str w symbol_id u =
     Log.debug log_dtc "-> [%s] %s D %s"
       addr_str pair (Format.asprintf "%a" Sexplib.Sexp.pp (Plnx.Book.sexp_of_entry u));
-    let update_type = if u.qty = 0. then `market_depth_delete_level else
-        `market_depth_insert_update_level in
-    let update = DTC.default_market_depth_update_level () in
-    update.symbol_id <- Some symbol_id ;
+    let update_type =
+      if u.qty = 0.
+      then `market_depth_delete_level
+      else `market_depth_insert_update_level in
     update.side <- Some (at_bid_or_ask_to_dtc u.side) ;
     update.update_type <- Some update_type ;
     update.price <- Some u.price ;
@@ -426,9 +428,11 @@ let on_book_updates pair ts updates =
     write_message w `market_depth_update_level
       DTC.gen_market_depth_update_level update
   in
+  let update = DTC.default_market_depth_update_level () in
   let on_connection { Connection.addr; w; subs; subs_depth; _ } =
     let on_symbol_id symbol_id =
-      List.iter updates ~f:(send_depth_updates addr w symbol_id);
+      update.symbol_id <- Some symbol_id ;
+      List.iter updates ~f:(send_depth_updates update addr w symbol_id);
     in
     Option.iter String.Table.(find subs_depth pair) ~f:on_symbol_id
   in
@@ -681,31 +685,28 @@ let market_depth_accept
   (****************************************************************************)
   String.Table.set subs_depth symbol symbol_id;
   let snap = DTC.default_market_depth_snapshot_level () in
+  snap.symbol_id <- Some symbol_id ;
+  snap.side <- Some `at_bid ;
+  snap.is_last_message_in_batch <- Some false ;
   ignore @@ Float.Map.fold_right bid ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-    snap.symbol_id <- Some symbol_id ;
-    snap.side <- Some `at_bid ;
     snap.price <- Some price ;
     snap.quantity <- Some qty ;
     snap.level <- Some lvl ;
     snap.is_first_message_in_batch <- Some (lvl = 1l) ;
-    snap.is_last_message_in_batch <- Some false ;
     write_message w `market_depth_snapshot_level
       DTC.gen_market_depth_snapshot_level snap ;
     Int32.succ lvl
   end;
+  snap.side <- Some `at_ask ;
   ignore @@ Float.Map.fold ask ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-    snap.symbol_id <- Some symbol_id ;
-    snap.side <- Some `at_ask ;
     snap.price <- Some price ;
     snap.quantity <- Some qty ;
     snap.level <- Some lvl ;
     snap.is_first_message_in_batch <- Some (lvl = 1l && Float.Map.is_empty bid) ;
-    snap.is_last_message_in_batch <- Some false ;
     write_message w `market_depth_snapshot_level
       DTC.gen_market_depth_snapshot_level snap ;
     Int32.succ lvl
   end;
-  snap.symbol_id <- Some symbol_id ;
   snap.side <- None ;
   snap.price <- None ;
   snap.quantity <- None ;
