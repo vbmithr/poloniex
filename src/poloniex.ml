@@ -56,7 +56,6 @@ let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
 let bids : Float.t Float.Map.t String.Table.t = String.Table.create ()
 let asks : Float.t Float.Map.t String.Table.t = String.Table.create ()
-let latest_trades : Trade.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
 
@@ -378,7 +377,6 @@ let buy_sell_of_dtc : DTC.buy_sell_enum -> Side.t = function
 
 let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
-  String.Table.set latest_trades pair t;
   (* Send trade updates to subscribers. *)
   let on_connection { Connection.addr; w; subs; _} =
     let on_symbol_id symbol_id =
