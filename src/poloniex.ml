@@ -717,17 +717,17 @@ let market_depth_accept
   Log.debug log_dtc "-> [%s] Market Depth Snapshot %s %s (%d/%d)"
     addr symbol exchange (Float.Map.length bid) (Float.Map.length ask)
 
+let market_depth_reject addr w symbol_id k = Printf.ksprintf begin fun reject_text ->
+    let rej = DTC.default_market_depth_reject () in
+    rej.symbol_id <- Some symbol_id ;
+    rej.reject_text <- Some reject_text ;
+    Log.debug log_dtc "-> [%s] Market Depth Reject: %ld %s"
+      addr symbol_id reject_text;
+    write_message w `market_depth_reject
+      DTC.gen_market_depth_reject rej
+  end k
+
 let market_depth_request addr w msg =
-  let reject w symbol_id k = Printf.ksprintf begin fun reject_text ->
-      let rej = DTC.default_market_depth_reject () in
-      rej.symbol_id <- Some symbol_id ;
-      rej.reject_text <- Some reject_text ;
-      Log.debug log_dtc "-> [%s] Market Depth Reject: %ld %s"
-        addr symbol_id reject_text;
-      write_message w `market_depth_reject
-        DTC.gen_market_depth_reject rej
-    end k
-  in
   let req = DTC.parse_market_depth_request msg in
   let ({ Connection.addr; subs_depth; _ } as conn) =
     String.Table.find_exn Connection.active addr in
@@ -737,14 +737,14 @@ let market_depth_request addr w msg =
       if req.request_action = Some `unsubscribe then
         String.Table.remove subs_depth symbol
       else if exchange <> my_exchange then
-        reject w symbol_id "No such exchange %s" exchange
+        market_depth_reject addr w symbol_id "No such exchange %s" exchange
       else if not String.Table.(mem tickers symbol) then
-        reject w symbol_id "No such symbol %s" symbol
+        market_depth_reject addr w symbol_id "No such symbol %s" symbol
       else begin match String.Table.(find bids symbol, find asks symbol) with
         | Some bid, Some ask ->
           market_depth_accept ~conn ~req ~bid ~ask
         | _ ->
-          reject w symbol_id "No orderbook for %s %s" symbol exchange
+          market_depth_reject addr w symbol_id "No orderbook for %s %s" symbol exchange
       end
     | _ -> ()
 
