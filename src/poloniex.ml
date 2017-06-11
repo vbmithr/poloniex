@@ -467,7 +467,7 @@ let ws ?heartbeat ?wait_for_pong () =
         String.Table.set tickers symbol (now, t);
         on_ticker_update symbol now old_t t
       | sym ->
-        let iter_f msg = match Ws.of_msgpck msg with
+        let iter_f msg = match Ws.M.to_msg msg with
         | Error msg -> failwith msg
         | Ok { typ="newTrade"; data } ->
           let t = Ws.M.read_trade data in
@@ -492,7 +492,7 @@ let ws ?heartbeat ?wait_for_pong () =
     clear_books ()
   in
   don't_wait_for (clear_books ()) ;
-  let ws = Ws.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
+  let ws = Ws.M.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> Log.error log_plnx "%s" @@ Exn.to_string exn)
