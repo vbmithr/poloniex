@@ -3,7 +3,7 @@ open Async
 
 open Plnx
 module Rest = Plnx_rest
-module Ws = Plnx_ws
+open Plnx_ws
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
@@ -438,14 +438,13 @@ let on_book_updates pair ts updates =
   in
   String.Table.iter Connection.active ~f:on_connection
 
-let subscribe to_ws_w sym =
-  Ws.M.subscribe to_ws_w [sym] >>| function
-  | [reqid] -> Int.Table.set reqid_to_sym reqid sym
-  | _ -> invalid_argf "subscribe to %s" sym ()
-
 let ws ?heartbeat ?wait_for_pong () =
+  let subscribe to_ws_w sym =
+    M.subscribe to_ws_w [sym] >>| function
+    | [reqid] -> Int.Table.set reqid_to_sym reqid sym
+    | _ -> invalid_argf "subscribe to %s" sym () in
   let to_ws, to_ws_w = Pipe.create () in
-  let on_msg ?(sym="") now msg = match Ws.M.to_msg msg with
+  let on_msg ?(sym="") now msg = match Msg.of_element msg with
     | Ticker t ->
       let old_ts, old_t = Option.value ~default:(Time_ns.epoch, t) @@
         String.Table.find tickers t.symbol in
@@ -461,7 +460,8 @@ let ws ?heartbeat ?wait_for_pong () =
   let on_ws_msg msg =
     let now = Time_ns.now () in
     match msg with
-    | Wamp.Welcome _ ->
+    | M.Welcome _ ->
+      Log.info log_plnx "[WS] Got Welcome message, subscribing." ;
       Int.Table.clear reqid_to_sym;
       Int.Table.clear subid_to_sym;
       String.Table.clear sym_to_subid;
@@ -469,11 +469,12 @@ let ws ?heartbeat ?wait_for_pong () =
       Deferred.List.iter ~f:(subscribe to_ws_w) @@ "ticker" :: String.Table.keys tickers
     | Subscribed { reqid; id } ->
       let sym = Int.Table.find_exn reqid_to_sym reqid in
+      Log.info log_plnx "[WS] Subscription to %s successful" sym ;
       Int.Table.set subid_to_sym id sym;
       String.Table.set sym_to_subid sym id
     | Event { pubid; subid; details; args; kwArgs } ->
       begin match Int.Table.find_exn subid_to_sym subid with
-        | "ticker" -> on_msg now (Msgpck.List args)
+        | "ticker" -> on_msg now (Wamp.Element.List args)
         | sym -> List.iter args ~f:(on_msg ~sym now)
       end
     | msg -> Log.error log_plnx "unknown message"
@@ -486,7 +487,7 @@ let ws ?heartbeat ?wait_for_pong () =
     clear_books ()
   in
   don't_wait_for (clear_books ()) ;
-  let ws = Ws.M.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
+  let ws = M.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> Log.error log_plnx "%s" @@ Exn.to_string exn)
