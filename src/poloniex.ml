@@ -445,6 +445,19 @@ let subscribe to_ws_w sym =
 
 let ws ?heartbeat ?wait_for_pong () =
   let to_ws, to_ws_w = Pipe.create () in
+  let on_msg ?(sym="") now msg = match Ws.M.to_msg msg with
+    | Ticker t ->
+      let old_ts, old_t = Option.value ~default:(Time_ns.epoch, t) @@
+        String.Table.find tickers t.symbol in
+      String.Table.set tickers t.symbol (now, t);
+      on_ticker_update t.symbol now old_t t
+    | BookModify entry -> on_book_updates sym now [entry]
+    | BookRemove entry -> on_book_updates sym now [entry]
+    | Trade t ->
+      Log.debug log_plnx "<- %s %s"
+        sym @@ Fn.compose Sexp.to_string Trade.sexp_of_t t;
+      on_trade_update sym t
+  in
   let on_ws_msg msg =
     let now = Time_ns.now () in
     match msg with
@@ -460,27 +473,8 @@ let ws ?heartbeat ?wait_for_pong () =
       String.Table.set sym_to_subid sym id
     | Event { pubid; subid; details; args; kwArgs } ->
       begin match Int.Table.find_exn subid_to_sym subid with
-      | "ticker" ->
-        let { Ticker.symbol } as t = Ws.M.read_ticker @@ List args in
-        let old_ts, old_t =
-          Option.value ~default:(Time_ns.epoch, t) @@ String.Table.find tickers symbol in
-        String.Table.set tickers symbol (now, t);
-        on_ticker_update symbol now old_t t
-      | sym ->
-        let iter_f msg = match Ws.M.to_msg msg with
-        | Error msg -> failwith msg
-        | Ok { typ="newTrade"; data } ->
-          let t = Ws.M.read_trade data in
-          Log.debug log_plnx "<- %s %s"
-            sym @@ Fn.compose Sexp.to_string Trade.sexp_of_t t;
-          on_trade_update sym t
-        | Ok { typ="orderBookModify"; data } ->
-          on_book_updates sym now [Ws.M.read_book data];
-        | Ok { typ="orderBookRemove"; data } ->
-          on_book_updates sym now [Ws.M.read_book data];
-        | Ok { typ } -> failwithf "unexpected message type %s" typ ()
-        in
-        List.iter args ~f:iter_f
+        | "ticker" -> on_msg now (Msgpck.List args)
+        | sym -> List.iter args ~f:(on_msg ~sym now)
       end
     | msg -> Log.error log_plnx "unknown message"
   in
@@ -539,6 +533,7 @@ let logon_response ~result_text ~trading_supported =
 let logon_request addr w msg =
   let req = DTC.parse_logon_request msg in
   let int1 = Option.value ~default:0l req.integer_1 in
+  let int2 = Option.value ~default:0l req.integer_2 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
   Log.debug log_dtc "<- [%s] Logon Request" addr;
   let accept trading =
@@ -560,8 +555,8 @@ let logon_request addr w msg =
       end
     end
   in
-  begin match req.username, req.password with
-    | Some key, Some secret ->
+  begin match req.username, req.password, int2 with
+    | Some key, Some secret, 0l ->
       don't_wait_for begin
         Connection.setup ~addr ~w ~key ~secret ~send_secdefs >>| function
         | true -> accept @@ Result.return "Valid Poloniex credentials"
