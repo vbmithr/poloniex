@@ -3,7 +3,7 @@ open Async
 
 open Plnx
 module Rest = Plnx_rest
-open Plnx_ws
+module Ws = Plnx_ws_new
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
@@ -48,14 +48,19 @@ let log_plnx =
 let log_dtc =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
-let reqid_to_sym : String.t Int.Table.t = Int.Table.create ()
 let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
-let sym_to_subid : Int.t String.Table.t = String.Table.create ()
 
 let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
-let bids : Float.t Float.Map.t String.Table.t = String.Table.create ()
-let asks : Float.t Float.Map.t String.Table.t = String.Table.create ()
+
+type book = {
+  ts : Time_ns.t ;
+  book : Float.t Float.Map.t ;
+}
+
+let bids : book String.Table.t = String.Table.create ()
+let asks : book String.Table.t = String.Table.create ()
+let latest_trades : Trade.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
 
@@ -389,15 +394,15 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
       write_message w `market_data_update_trade
         DTC.gen_market_data_update_trade update ;
       Log.debug log_dtc "-> [%s] %s T %s"
-        addr pair (Format.asprintf "%a" Sexplib.Sexp.pp (Trade.sexp_of_t t));
+        addr pair (Sexplib.Sexp.to_string (Trade.sexp_of_t t));
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
   String.Table.iter Connection.active ~f:on_connection
 
 let on_book_updates pair ts updates =
-  let bid = String.Table.find_or_add bids pair ~default:(fun () -> Float.Map.empty) in
-  let ask = String.Table.find_or_add asks pair ~default:(fun () -> Float.Map.empty) in
+  let { book = bid } = String.Table.find_exn bids pair in
+  let { book = ask } = String.Table.find_exn asks pair in
   let fold_updates (bid, ask) { Plnx.Book.side; price; qty } =
     match side with
     | `Buy ->
@@ -405,18 +410,18 @@ let on_book_updates pair ts updates =
        else Float.Map.remove bid price),
       ask
     | `Sell ->
-        (if qty > 0. then Float.Map.add ask ~key:price ~data:qty
-         else Float.Map.remove ask price),
-        bid
+      (if qty > 0. then Float.Map.add ask ~key:price ~data:qty
+       else Float.Map.remove ask price),
+      bid
   in
   let bid, ask = List.fold_left ~init:(bid, ask) updates ~f:fold_updates in
-  String.Table.set bids pair bid ;
-  String.Table.set asks pair ask ;
+  String.Table.set bids pair { ts ; book = bid } ;
+  String.Table.set asks pair { ts ; book = ask } ;
   let send_depth_updates
       (update : DTC.Market_depth_update_level.t)
       addr_str w symbol_id u =
     Log.debug log_dtc "-> [%s] %s D %s"
-      addr_str pair (Format.asprintf "%a" Sexplib.Sexp.pp (Plnx.Book.sexp_of_entry u));
+      addr_str pair (Sexplib.Sexp.to_string (Plnx.Book.sexp_of_entry u));
     let update_type =
       if u.qty = 0.
       then `market_depth_delete_level
@@ -438,58 +443,48 @@ let on_book_updates pair ts updates =
   in
   String.Table.iter Connection.active ~f:on_connection
 
-let ws ?heartbeat ?wait_for_pong () =
-  let subscribe to_ws_w sym =
-    M.subscribe to_ws_w [sym] >>| function
-    | [reqid] -> Int.Table.set reqid_to_sym reqid sym
-    | _ -> invalid_argf "subscribe to %s" sym () in
+let ws ?heartbeat timeout =
+  let latest_ts = ref Time_ns.epoch in
   let to_ws, to_ws_w = Pipe.create () in
-  let on_msg ?(sym="") now msg = match Msg.of_element msg with
-    | Ticker t ->
-      let old_ts, old_t = Option.value ~default:(Time_ns.epoch, t) @@
-        String.Table.find tickers t.symbol in
-      String.Table.set tickers t.symbol (now, t);
-      on_ticker_update t.symbol now old_t t
-    | BookModify entry -> on_book_updates sym now [entry]
-    | BookRemove entry -> on_book_updates sym now [entry]
+  let initialized = ref false in
+  let on_event subid id now = function
+    | Ws.Repr.Snapshot { symbol ; bid ; ask } ->
+      Int.Table.set subid_to_sym subid symbol ;
+      String.Table.set bids ~key:symbol ~data:{ ts = now ; book = bid } ;
+      String.Table.set asks ~key:symbol ~data:{ ts = now ; book = ask }
+    | Update entry ->
+      let symbol = Int.Table.find_exn subid_to_sym subid in
+      on_book_updates symbol now [entry]
     | Trade t ->
-      Log.debug log_plnx "<- %s %s"
-        sym @@ Fn.compose Sexp.to_string Trade.sexp_of_t t;
-      on_trade_update sym t
+      let symbol = Int.Table.find_exn subid_to_sym subid in
+      String.Table.set latest_trades symbol t ;
+      on_trade_update symbol t
   in
-  let on_ws_msg msg =
+  let on_msg msg =
     let now = Time_ns.now () in
+    latest_ts := now ;
     match msg with
-    | M.Welcome _ ->
-      Log.info log_plnx "[WS] Got Welcome message, subscribing." ;
-      Int.Table.clear reqid_to_sym;
-      Int.Table.clear subid_to_sym;
-      String.Table.clear sym_to_subid;
-      don't_wait_for @@
-      Deferred.List.iter ~f:(subscribe to_ws_w) @@ "ticker" :: String.Table.keys tickers
-    | Subscribed { reqid; id } ->
-      let sym = Int.Table.find_exn reqid_to_sym reqid in
-      Log.info log_plnx "[WS] Subscription to %s successful" sym ;
-      Int.Table.set subid_to_sym id sym;
-      String.Table.set sym_to_subid sym id
-    | Event { pubid; subid; details; args; kwArgs } ->
-      begin match Int.Table.find_exn subid_to_sym subid with
-        | "ticker" -> on_msg now (Wamp.Element.List args)
-        | sym -> List.iter args ~f:(on_msg ~sym now)
-      end
-    | msg -> Log.error log_plnx "unknown message"
+    | Ws.Repr.Error msg ->
+      Log.error log_plnx "[WS]: %s" msg
+    | Event { subid ; id ; events } ->
+      if not !initialized then begin
+        let symbols = String.Table.keys tickers in
+        List.iter symbols ~f:begin fun symbol ->
+          Pipe.write_without_pushback to_ws_w (Ws.Repr.Subscribe symbol)
+        end ;
+        initialized := true
+      end ;
+      List.iter events ~f:(on_event subid id now)
   in
-  let disconnected = Condition.create () in
-  let rec clear_books () =
-    Condition.wait disconnected >>= fun () ->
-    String.Table.clear bids ;
-    String.Table.clear asks ;
-    clear_books ()
-  in
-  don't_wait_for (clear_books ()) ;
-  let ws = M.open_connection ?heartbeat ~log:log_plnx ~disconnected to_ws in
+  let restart, ws = Ws.open_connection ?heartbeat ~log:log_plnx to_ws in
+  let watchdog () =
+    let now = Time_ns.now () in
+    let diff = Time_ns.diff now !latest_ts in
+    if Time_ns.(!latest_ts <> epoch) && Time_ns.Span.(diff > timeout) then
+      Condition.signal restart () in
+  Clock_ns.every timeout watchdog ;
   Monitor.handle_errors
-    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
+    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_msg)
     (fun exn -> Log.error log_plnx "%s" @@ Exn.to_string exn)
 
 let heartbeat addr w ival =
@@ -604,7 +599,6 @@ let security_definition_request addr w msg =
       end
     | _ -> ()
 
-
 let reject_market_data_request ?symbol_id addr w k =
   Printf.ksprintf begin fun reject_text ->
     let rej = DTC.default_market_data_reject () in
@@ -622,10 +616,16 @@ let gen_market_data_snap symbol_id symbol exchange addr w =
     snap.session_high_price <- Some t.high24h ;
     snap.session_low_price <- Some t.low24h ;
     snap.session_volume <- Some t.base_volume ;
-    snap.last_trade_price <- Some t.last ;
-    snap.bid_ask_date_time <- Some (float_of_time ts) ;
+    begin match String.Table.find latest_trades symbol with
+      | None -> ()
+      | Some { gid; id; ts; side; price; qty } ->
+        snap.last_trade_price <- Some price ;
+        snap.last_trade_volume <- Some qty ;
+        snap.last_trade_date_time <- Some (float_of_time ts) ;
+    end ;
     begin match String.Table.(find bids symbol, find asks symbol) with
-      | Some bid, Some ask  ->
+      | Some { ts ; book = bid }, Some { book = ask }  ->
+        snap.bid_ask_date_time <- Some (float_of_time ts) ;
         begin match Float.Map.max_elt bid with
           | None -> ()
           | Some (bbp, bbq) ->
@@ -673,36 +673,45 @@ let market_data_request addr w msg =
 let market_depth_accept
     ~conn:{ Connection.addr ; w ; subs_depth }
     ~req
-    ~bid ~ask =
+    ~bid:{ ts = bid_ts ; book = bid }
+    ~ask:{ ts = bid_ts ; book = ask }
+  =
   (* OK because we sanitize before *******************************************)
   let symbol_id = Option.value_exn req.DTC.Market_depth_request.symbol_id in
   let symbol = Option.value_exn req.DTC.Market_depth_request.symbol in
   let exchange = Option.value_exn req.DTC.Market_depth_request.exchange in
   (****************************************************************************)
+  let bid_size = Float.Map.length bid in
+  let ask_size = Float.Map.length ask in
+  let num_levels = Option.value_map req.num_levels ~default:50 ~f:Int32.to_int_exn in
   String.Table.set subs_depth symbol symbol_id;
   let snap = DTC.default_market_depth_snapshot_level () in
   snap.symbol_id <- Some symbol_id ;
   snap.side <- Some `at_bid ;
   snap.is_last_message_in_batch <- Some false ;
-  ignore @@ Float.Map.fold_right bid ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-    snap.price <- Some price ;
-    snap.quantity <- Some qty ;
-    snap.level <- Some lvl ;
-    snap.is_first_message_in_batch <- Some (lvl = 1l) ;
-    write_message w `market_depth_snapshot_level
-      DTC.gen_market_depth_snapshot_level snap ;
-    Int32.succ lvl
-  end;
-  snap.side <- Some `at_ask ;
-  ignore @@ Float.Map.fold ask ~init:1l ~f:begin fun ~key:price ~data:qty lvl ->
-    snap.price <- Some price ;
-    snap.quantity <- Some qty ;
-    snap.level <- Some lvl ;
-    snap.is_first_message_in_batch <- Some (lvl = 1l && Float.Map.is_empty bid) ;
-    write_message w `market_depth_snapshot_level
-      DTC.gen_market_depth_snapshot_level snap ;
-    Int32.succ lvl
-  end;
+  (* ignore @@ Float.Map.fold_right bid ~init:1 ~f:begin fun ~key:price ~data:qty lvl -> *)
+  (*   if lvl < num_levels then begin *)
+  (*     snap.price <- Some price ; *)
+  (*     snap.quantity <- Some qty ; *)
+  (*     snap.level <- Some (Int32.of_int_exn lvl) ; *)
+  (*     snap.is_first_message_in_batch <- Some (lvl = 1) ; *)
+  (*     write_message w `market_depth_snapshot_level *)
+  (*       DTC.gen_market_depth_snapshot_level snap *)
+  (*   end ; *)
+  (*   succ lvl *)
+  (* end; *)
+  (* snap.side <- Some `at_ask ; *)
+  (* ignore @@ Float.Map.fold ask ~init:1 ~f:begin fun ~key:price ~data:qty lvl -> *)
+  (*   if lvl < num_levels then begin *)
+  (*     snap.price <- Some price ; *)
+  (*     snap.quantity <- Some qty ; *)
+  (*     snap.level <- Some (Int32.of_int_exn lvl) ; *)
+  (*     snap.is_first_message_in_batch <- Some (lvl = 1 && Float.Map.is_empty bid) ; *)
+  (*     write_message w `market_depth_snapshot_level *)
+  (*       DTC.gen_market_depth_snapshot_level snap *)
+  (*   end ; *)
+  (*   succ lvl *)
+  (* end; *)
   snap.side <- None ;
   snap.price <- None ;
   snap.quantity <- None ;
@@ -712,7 +721,7 @@ let market_depth_accept
   write_message w `market_depth_snapshot_level
     DTC.gen_market_depth_snapshot_level snap ;
   Log.debug log_dtc "-> [%s] Market Depth Snapshot %s %s (%d/%d)"
-    addr symbol exchange (Float.Map.length bid) (Float.Map.length ask)
+    addr symbol exchange (Int.min bid_size num_levels) (Int.min ask_size num_levels)
 
 let market_depth_reject addr w symbol_id k = Printf.ksprintf begin fun reject_text ->
     let rej = DTC.default_market_depth_reject () in
@@ -1228,12 +1237,12 @@ let dtcserver ~server ~port =
 
 let loglevel_of_int = function 2 -> `Info | 3 -> `Debug | _ -> `Error
 
-let main update_client_span' heartbeat wait_for_pong tls port
+let main update_client_span' heartbeat timeout tls port
     daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
+  let timeout = Time_ns.Span.of_string timeout in
   sc_mode := sc ;
   update_client_span := Time_ns.Span.of_string update_client_span';
   let heartbeat = Option.map heartbeat ~f:Time_ns.Span.of_string in
-  let wait_for_pong = Option.map wait_for_pong ~f:Time_ns.Span.of_string in
   let dtcserver ~server ~port =
     dtcserver ~server ~port >>= fun dtc_server ->
     Log.info log_dtc "DTC server started";
@@ -1263,7 +1272,7 @@ let main update_client_span' heartbeat wait_for_pong tls port
     end >>= fun () ->
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     Deferred.all_unit [
-      loop_log_errors ~log:log_dtc (ws ?heartbeat ?wait_for_pong);
+      loop_log_errors ~log:log_dtc (fun () -> ws ?heartbeat timeout);
       loop_log_errors ~log:log_dtc (fun () -> dtcserver ~server ~port)
     ]
   end
@@ -1272,9 +1281,9 @@ let command =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "update-client−span" (optional_with_default "10s" string) ~doc:"span Span between client updates (default: 10s)"
-    +> flag "-heartbeat" (optional string) ~doc:" Heartbeat period (default: 25s)"
-    +> flag "-wait-for-pong" (optional string) ~doc:" max PONG waiting time (default: 5s)"
+    +> flag "-update-client−span" (optional_with_default "10s" string) ~doc:"span Span between client updates (default: 10s)"
+    +> flag "-heartbeat" (optional string) ~doc:" WS heartbeat period (default: 25s)"
+    +> flag "-timeout" (optional_with_default "60s" string) ~doc:" max Disconnect if no message received in N seconds (default: 60s)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
     +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
