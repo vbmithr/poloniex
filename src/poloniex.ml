@@ -476,7 +476,14 @@ let ws ?heartbeat timeout =
       end ;
       List.iter events ~f:(on_event subid id now)
   in
-  let restart, ws = Ws.open_connection ?heartbeat ~log:log_plnx to_ws in
+  let connected = Condition.create () in
+  let restart, ws =
+    Ws.open_connection ?heartbeat ~log:log_plnx ~connected to_ws in
+  let rec handle_init () =
+    Condition.wait connected >>= fun () ->
+    initialized := false ;
+    handle_init () in
+  don't_wait_for (handle_init ()) ;
   let watchdog () =
     let now = Time_ns.now () in
     let diff = Time_ns.diff now !latest_ts in
