@@ -729,21 +729,21 @@ let market_depth_request addr w msg =
   let ({ Connection.addr; subs_depth; _ } as conn) =
     String.Table.find_exn Connection.active addr in
   match req.symbol_id, req.symbol, req.exchange with
-    | Some symbol_id, Some symbol, Some exchange ->
-      Log.debug log_dtc "<- [%s] Market Depth Request %s %s" addr symbol exchange ;
-      if req.request_action = Some `unsubscribe then
-        String.Table.remove subs_depth symbol
-      else if exchange <> my_exchange then
-        market_depth_reject addr w symbol_id "No such exchange %s" exchange
-      else if not String.Table.(mem tickers symbol) then
-        market_depth_reject addr w symbol_id "No such symbol %s" symbol
-      else begin match String.Table.(find bids symbol, find asks symbol) with
-        | Some bid, Some ask ->
-          market_depth_accept ~conn ~req ~bid ~ask
-        | _ ->
-          market_depth_reject addr w symbol_id "No orderbook for %s %s" symbol exchange
-      end
-    | _ -> ()
+  | Some symbol_id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Depth Request %s %s" addr symbol exchange ;
+    if req.request_action = Some `unsubscribe then
+      String.Table.remove subs_depth symbol
+    else if exchange <> my_exchange then
+      market_depth_reject addr w symbol_id "No such exchange %s" exchange
+    else if not String.Table.(mem tickers symbol) then
+      market_depth_reject addr w symbol_id "No such symbol %s" symbol
+    else begin match String.Table.(find bids symbol, find asks symbol) with
+      | Some bid, Some ask ->
+        market_depth_accept ~conn ~req ~bid ~ask
+      | _ ->
+        market_depth_reject addr w symbol_id "No orderbook for %s %s" symbol exchange
+    end
+  | _ -> ()
 
 let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
