@@ -499,8 +499,7 @@ let heartbeat addr w ival =
   let msg = DTC.default_heartbeat () in
   let rec loop () =
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    let { Connection.addr; dropped; _ } =
-      String.Table.find_exn Connection.active addr in
+    let { Connection.dropped } = String.Table.find_exn Connection.active addr in
     Log.debug log_dtc "-> [%s] Heartbeat" addr;
     msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
     write_message w `heartbeat DTC.gen_heartbeat msg ;
@@ -573,10 +572,7 @@ let logon_request addr w msg =
       accept @@ Result.fail "No credentials"
   end
 
-let heartbeat addr w msg =
-  let { Connection.addr } =
-    String.Table.find_exn Connection.active addr in
-  Log.debug log_dtc "<- [%s] Heartbeat" addr
+let heartbeat addr w msg = Log.debug log_dtc "<- [%s] Heartbeat" addr
 
 let security_definition_request addr w msg =
   let reject addr_str request_id symbol =
@@ -590,8 +586,6 @@ let security_definition_request addr w msg =
   let req = DTC.parse_security_definition_for_symbol_request msg in
   match req.request_id, req.symbol, req.exchange with
     | Some request_id, Some symbol, Some exchange ->
-      let { Connection.addr } =
-        String.Table.find_exn Connection.active addr in
       Log.debug log_dtc "<- [%s] Sec Def Request %ld %s %s"
         addr request_id symbol exchange ;
       if exchange <> my_exchange then reject addr request_id symbol
@@ -654,7 +648,7 @@ let market_data_request addr w msg =
   let req = DTC.parse_market_data_request msg in
   match req.symbol_id, req.symbol, req.exchange with
   | Some symbol_id, Some symbol, Some exchange ->
-    let { Connection.addr; subs; _ } =
+    let { Connection.subs } =
       String.Table.find_exn Connection.active addr in
     Log.debug log_dtc "<- [%s] Market Data Req %ld %s %s"
       addr symbol_id symbol exchange ;
@@ -742,7 +736,7 @@ let market_depth_reject addr w symbol_id k = Printf.ksprintf begin fun reject_te
 
 let market_depth_request addr w msg =
   let req = DTC.parse_market_depth_request msg in
-  let ({ Connection.addr; subs_depth; _ } as conn) =
+  let ({ Connection.subs_depth } as conn) =
     String.Table.find_exn Connection.active addr in
   match req.symbol_id, req.symbol, req.exchange with
   | Some symbol_id, Some symbol, Some exchange ->
@@ -765,7 +759,7 @@ let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   match req.request_id with
   | Some request_id ->
-    let { Connection.addr; orders } =
+    let { Connection.orders } =
       String.Table.find_exn Connection.active addr in
     Log.debug log_dtc "<- [%s] Open Orders Request %ld" addr request_id ;
     let nb_open_orders = Int.Table.length orders in
@@ -807,7 +801,7 @@ let open_orders_request addr w msg =
   | _ -> ()
 
 let current_positions_request addr w msg =
-  let { Connection.addr; positions } =
+  let { Connection.positions } =
     String.Table.find_exn Connection.active addr in
   Log.debug log_dtc "<- [%s] Positions" addr;
   let nb_msgs = String.Table.length positions in
@@ -838,7 +832,7 @@ let current_positions_request addr w msg =
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
 let historical_order_fills addr w msg =
-  let { Connection.addr; key; secret; trades } =
+  let { Connection.key; secret; trades } =
     String.Table.find_exn Connection.active addr in
   let req = DTC.parse_historical_order_fills_request msg in
   let resp = DTC.default_historical_order_fill_response () in
@@ -894,8 +888,6 @@ let historical_order_fills addr w msg =
 let trade_account_request addr w msg =
   let req = DTC.parse_trade_accounts_request msg in
   let resp = DTC.default_trade_account_response () in
-  let { Connection.addr } =
-    String.Table.find_exn Connection.active addr in
   Log.debug log_dtc "<- [%s] TradeAccountsRequest" addr;
   let accounts = [exchange_account; margin_account] in
   let nb_msgs = List.length accounts in
@@ -1105,7 +1097,7 @@ let reject_cancel_order
   end k
 
 let cancel_order addr w msg =
-  let ({ Connection.addr; key; secret } as c) =
+  let ({ Connection.key; secret } as c) =
     String.Table.find_exn Connection.active addr in
     let req = DTC.parse_cancel_order msg in
     match Option.map req.server_order_id ~f:Int.of_string with
