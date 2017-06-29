@@ -496,8 +496,8 @@ let ws ?heartbeat timeout =
 
 let heartbeat addr w ival =
   let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
+  let msg = DTC.default_heartbeat () in
   let rec loop () =
-    let msg = DTC.default_heartbeat () in
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
     let { Connection.addr; dropped; _ } =
       String.Table.find_exn Connection.active addr in
