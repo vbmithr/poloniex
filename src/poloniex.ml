@@ -122,6 +122,11 @@ module Connection = struct
 
   let active : t String.Table.t = String.Table.create ()
 
+  let find = String.Table.find active
+  let find_exn = String.Table.find_exn active
+  let set = String.Table.set active
+  let remove = String.Table.remove active
+
   let update_positions { addr; w; key; secret; positions } =
     let write_update ?(price=0.) ?(qty=0.) symbol =
       let update = DTC.default_position_update () in
@@ -289,7 +294,7 @@ module Connection = struct
       trades = String.Table.create () ;
       positions = String.Table.create () ;
     } in
-    String.Table.set active ~key:addr ~data:conn;
+    set ~key:addr ~data:conn ;
     if key = "" || secret = "" then Deferred.return false
     else begin
       Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
@@ -499,7 +504,7 @@ let heartbeat addr w ival =
   let msg = DTC.default_heartbeat () in
   let rec loop () =
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    let { Connection.dropped } = String.Table.find_exn Connection.active addr in
+    let { Connection.dropped } = Connection.find_exn addr in
     Log.debug log_dtc "-> [%s] Heartbeat" addr;
     msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
     write_message w `heartbeat DTC.gen_heartbeat msg ;
@@ -648,8 +653,7 @@ let market_data_request addr w msg =
   let req = DTC.parse_market_data_request msg in
   match req.symbol_id, req.symbol, req.exchange with
   | Some symbol_id, Some symbol, Some exchange ->
-    let { Connection.subs } =
-      String.Table.find_exn Connection.active addr in
+    let { Connection.subs } = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Market Data Req %ld %s %s"
       addr symbol_id symbol exchange ;
     if req.request_action = Some `unsubscribe then
@@ -736,8 +740,7 @@ let market_depth_reject addr w symbol_id k = Printf.ksprintf begin fun reject_te
 
 let market_depth_request addr w msg =
   let req = DTC.parse_market_depth_request msg in
-  let ({ Connection.subs_depth } as conn) =
-    String.Table.find_exn Connection.active addr in
+  let ({ Connection.subs_depth } as conn) = Connection.find_exn addr in
   match req.symbol_id, req.symbol, req.exchange with
   | Some symbol_id, Some symbol, Some exchange ->
     Log.debug log_dtc "<- [%s] Market Depth Request %s %s" addr symbol exchange ;
@@ -759,8 +762,7 @@ let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   match req.request_id with
   | Some request_id ->
-    let { Connection.orders } =
-      String.Table.find_exn Connection.active addr in
+    let { Connection.orders } = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Open Orders Request %ld" addr request_id ;
     let nb_open_orders = Int.Table.length orders in
     let send_order_update
@@ -801,8 +803,7 @@ let open_orders_request addr w msg =
   | _ -> ()
 
 let current_positions_request addr w msg =
-  let { Connection.positions } =
-    String.Table.find_exn Connection.active addr in
+  let { Connection.positions } = Connection.find_exn addr in
   Log.debug log_dtc "<- [%s] Positions" addr;
   let nb_msgs = String.Table.length positions in
   let req = DTC.parse_current_positions_request msg in
@@ -832,8 +833,7 @@ let current_positions_request addr w msg =
   Log.debug log_dtc "-> [%s] %d positions" addr nb_msgs
 
 let historical_order_fills addr w msg =
-  let { Connection.key; secret; trades } =
-    String.Table.find_exn Connection.active addr in
+  let { Connection.key; secret; trades } = Connection.find_exn addr in
   let req = DTC.parse_historical_order_fills_request msg in
   let resp = DTC.default_historical_order_fill_response () in
   Log.debug log_dtc "<- [%s] Historical Order Fills Req" addr ;
@@ -904,7 +904,7 @@ let trade_account_request addr w msg =
 
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
-  let c = String.Table.find_exn Connection.active addr in
+  let c = Connection.find_exn addr in
   let reject account =
     let rej = DTC.default_account_balance_reject () in
     rej.request_id <- req.request_id ;
@@ -1073,7 +1073,7 @@ let submit_new_single_order
   don't_wait_for (submit_order_api ~c ~req)
 
 let submit_new_single_order addr w msg =
-  let c = String.Table.find_exn Connection.active addr in
+  let c = Connection.find_exn addr in
   let req = DTC.parse_submit_new_single_order msg in
   Log.debug log_dtc "<- [%s] Submit New Single Order" c.Connection.addr ;
   try submit_new_single_order ~c ~req with
@@ -1097,8 +1097,7 @@ let reject_cancel_order
   end k
 
 let cancel_order addr w msg =
-  let ({ Connection.key; secret } as c) =
-    String.Table.find_exn Connection.active addr in
+  let ({ Connection.key; secret } as c) = Connection.find_exn addr in
     let req = DTC.parse_cancel_order msg in
     match Option.map req.server_order_id ~f:Int.of_string with
     | None ->
@@ -1143,7 +1142,7 @@ let reject_cancel_replace_order
   end k
 
 let cancel_replace_order addr w msg =
-  let c = String.Table.find_exn Connection.active addr in
+  let c = Connection.find_exn addr in
   let req = DTC.parse_cancel_replace_order msg in
   Log.debug log_dtc "<- [%s] Cancel Replace Order" c.addr ;
   if Option.is_some req.order_type then
@@ -1213,12 +1212,12 @@ let dtcserver ~server ~port =
         end
     in
     let on_connection_io_error exn =
-      String.Table.remove Connection.active addr ;
+      Connection.remove addr ;
       Log.error log_dtc "on_connection_io_error (%s): %s" addr Exn.(to_string exn)
     in
     let cleanup () =
       Log.info log_dtc "client %s disconnected" addr ;
-      String.Table.remove Connection.active addr ;
+      Connection.remove addr ;
       Deferred.all_unit [Writer.close w; Reader.close r]
     in
     Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
