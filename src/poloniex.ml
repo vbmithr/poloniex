@@ -53,13 +53,27 @@ let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
 let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
 
-type book = {
-  ts : Time_ns.t ;
-  book : Float.t Float.Map.t ;
-}
+module Book = struct
+  type t = {
+    ts : Time_ns.t ;
+    book : Float.t Float.Map.t ;
+  }
 
-let bids : book String.Table.t = String.Table.create ()
-let asks : book String.Table.t = String.Table.create ()
+  let empty = {
+    ts = Time_ns.epoch ;
+    book = Float.Map.empty
+  }
+
+  let bids : t String.Table.t = String.Table.create ()
+  let asks : t String.Table.t = String.Table.create ()
+
+  let get_bids = String.Table.find_or_add bids ~default:(fun () -> empty)
+  let get_asks = String.Table.find_or_add asks ~default:(fun () -> empty)
+
+  let set_bids ~symbol ~ts ~book = String.Table.set bids ~key:symbol ~data:{ ts ; book }
+  let set_asks ~symbol ~ts ~book = String.Table.set asks ~key:symbol ~data:{ ts ; book }
+end
+
 let latest_trades : Trade.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
@@ -108,7 +122,9 @@ module Connection = struct
     secret: string;
     mutable dropped: int;
     subs: Int32.t String.Table.t;
+    rev_subs : string Int32.Table.t;
     subs_depth: Int32.t String.Table.t;
+    rev_subs_depth : string Int32.Table.t;
     (* Balances *)
     b_exchange: Rest.Balance.t String.Table.t;
     b_margin: Float.t String.Table.t;
@@ -286,7 +302,9 @@ module Connection = struct
       send_secdefs ;
       dropped = 0 ;
       subs = String.Table.create () ;
+      rev_subs = Int32.Table.create () ;
       subs_depth = String.Table.create () ;
+      rev_subs_depth = Int32.Table.create () ;
       b_exchange = String.Table.create () ;
       b_margin = String.Table.create () ;
       margin = Rest.MarginAccountSummary.empty ;
@@ -406,8 +424,8 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
   String.Table.iter Connection.active ~f:on_connection
 
 let on_book_updates pair ts updates =
-  let { book = bid } = String.Table.find_exn bids pair in
-  let { book = ask } = String.Table.find_exn asks pair in
+  let bids  = Book.get_bids pair in
+  let asks = Book.get_asks pair in
   let fold_updates (bid, ask) { Plnx.Book.side; price; qty } =
     match side with
     | `Buy ->
@@ -419,9 +437,10 @@ let on_book_updates pair ts updates =
        else Float.Map.remove ask price),
       bid
   in
-  let bid, ask = List.fold_left ~init:(bid, ask) updates ~f:fold_updates in
-  String.Table.set bids pair { ts ; book = bid } ;
-  String.Table.set asks pair { ts ; book = ask } ;
+  let bids, asks =
+    List.fold_left ~init:(bids.book, asks.book) updates ~f:fold_updates in
+  Book.set_bids ~symbol:pair ~ts ~book:bids ;
+  Book.set_asks ~symbol:pair ~ts ~book:asks ;
   let send_depth_updates
       (update : DTC.Market_depth_update_level.t)
       addr_str w symbol_id u =
@@ -455,8 +474,8 @@ let ws ?heartbeat timeout =
   let on_event subid id now = function
     | Ws.Repr.Snapshot { symbol ; bid ; ask } ->
       Int.Table.set subid_to_sym subid symbol ;
-      String.Table.set bids ~key:symbol ~data:{ ts = now ; book = bid } ;
-      String.Table.set asks ~key:symbol ~data:{ ts = now ; book = ask }
+      Book.set_bids ~symbol ~ts:now ~book:bid ;
+      Book.set_asks ~symbol ~ts:now ~book:ask ;
     | Update entry ->
       let symbol = Int.Table.find_exn subid_to_sym subid in
       on_book_updates symbol now [entry]
@@ -605,93 +624,91 @@ let security_definition_request addr w msg =
       end
     | _ -> ()
 
-let reject_market_data_request ?symbol_id addr w k =
+let reject_market_data_request ?id addr w k =
   Printf.ksprintf begin fun reject_text ->
     let rej = DTC.default_market_data_reject () in
-    rej.symbol_id <- symbol_id ;
+    rej.symbol_id <- id ;
     rej.reject_text <- Some reject_text ;
     Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr reject_text;
-    write_message w `market_data_reject
-      DTC.gen_market_data_reject rej
+    write_message w `market_data_reject DTC.gen_market_data_reject rej
   end k
 
-let gen_market_data_snap symbol_id symbol exchange addr w =
-  Option.map (String.Table.find tickers symbol) ~f:begin fun (ts, t) ->
-    let snap = DTC.default_market_data_snapshot () in
-    snap.symbol_id <- Some symbol_id ;
-    snap.session_high_price <- Some t.high24h ;
-    snap.session_low_price <- Some t.low24h ;
-    snap.session_volume <- Some t.base_volume ;
-    begin match String.Table.find latest_trades symbol with
-      | None -> ()
-      | Some { gid; id; ts; side; price; qty } ->
-        snap.last_trade_price <- Some price ;
-        snap.last_trade_volume <- Some qty ;
-        snap.last_trade_date_time <- Some (float_of_time ts) ;
-    end ;
-    begin match String.Table.(find bids symbol, find asks symbol) with
-      | Some { ts ; book = bid }, Some { book = ask }  ->
-        snap.bid_ask_date_time <- Some (float_of_time ts) ;
-        begin match Float.Map.max_elt bid with
-          | None -> ()
-          | Some (bbp, bbq) ->
-            snap.bid_price <- Some bbp ;
-            snap.bid_quantity <- Some bbq
-        end ;
-        begin match Float.Map.min_elt ask with
-          | None -> ()
-          | Some (bap, baq) ->
-            snap.ask_price <- Some bap ;
-            snap.ask_quantity <- Some baq
-        end
-      | _ -> ()
-    end ;
-    snap
-  end
+let write_market_data_snapshot ?id symbol exchange addr w ts t =
+  let snap = DTC.default_market_data_snapshot () in
+  snap.symbol_id <- id ;
+  snap.session_high_price <- Some t.Ticker.high24h ;
+  snap.session_low_price <- Some t.low24h ;
+  snap.session_volume <- Some t.base_volume ;
+  begin match String.Table.find latest_trades symbol with
+    | None -> ()
+    | Some { gid; id; ts; side; price; qty } ->
+      snap.last_trade_price <- Some price ;
+      snap.last_trade_volume <- Some qty ;
+      snap.last_trade_date_time <- Some (float_of_time ts) ;
+  end ;
+  let bid = Book.get_bids symbol in
+  let ask = Book.get_asks symbol in
+  let ts = Time_ns.max bid.ts ask.ts in
+  if ts <> Time_ns.epoch then
+    snap.bid_ask_date_time <- Some (float_of_time ts) ;
+  Option.iter (Float.Map.max_elt bid.book) ~f:begin fun (price, qty) ->
+    snap.bid_price <- Some price ;
+    snap.bid_quantity <- Some qty
+  end ;
+  Option.iter (Float.Map.min_elt ask.book) ~f:begin fun (price, qty) ->
+    snap.ask_price <- Some price ;
+    snap.ask_quantity <- Some qty
+  end ;
+  write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
 
 let market_data_request addr w msg =
   let req = DTC.parse_market_data_request msg in
-  match req.symbol_id, req.symbol, req.exchange with
-  | Some symbol_id, Some symbol, Some exchange ->
-    let { Connection.subs } = Connection.find_exn addr in
-    Log.debug log_dtc "<- [%s] Market Data Req %ld %s %s"
-      addr symbol_id symbol exchange ;
-    if req.request_action = Some `unsubscribe then
-      String.Table.remove subs symbol
-    else if exchange <> my_exchange then
-      reject_market_data_request addr w ~symbol_id "No such exchange %s" exchange
-    else begin
-      match gen_market_data_snap symbol_id symbol exchange addr w with
-      | None ->
-        reject_market_data_request addr w ~symbol_id "No such symbol %s" symbol
-      | Some snap ->
-        String.Table.set subs symbol symbol_id;
-        Log.debug log_dtc "-> [%s] Market Data Snap %ld %s %s"
-          addr symbol_id symbol exchange ;
-        write_message w `market_data_snapshot
-          DTC.gen_market_data_snapshot snap
+  let { Connection.subs ; rev_subs } = Connection.find_exn addr in
+  match req.request_action,
+        req.symbol_id,
+        req.symbol,
+        req.exchange
+  with
+  | _, id, _, Some exchange when exchange <> my_exchange ->
+    reject_market_data_request ?id addr w "No such exchange %s" exchange
+  | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
+    reject_market_data_request ?id addr w "No such symbol %s" symbol
+  | Some `unsubscribe, Some id, _, _ ->
+    begin match Int32.Table.find rev_subs id with
+    | None -> ()
+    | Some symbol -> String.Table.remove subs symbol
+    end ;
+    Int32.Table.remove rev_subs id
+  | Some `snapshot, _, Some symbol, Some exchange ->
+    let ts, t = String.Table.find_exn tickers symbol in
+    write_market_data_snapshot symbol exchange addr w ts t ;
+    Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
+  | Some `subscribe, Some id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
+      addr id symbol exchange ;
+    begin
+      match Int32.Table.find rev_subs id with
+      | Some symbol' when symbol <> symbol' ->
+        reject_market_data_request addr w ~id
+          "Already subscribed to %s-%s with a different id (was %ld)"
+          symbol exchange id
+      | _ ->
+        String.Table.set subs symbol id ;
+        Int32.Table.set rev_subs id symbol ;
+        let ts, t = String.Table.find_exn tickers symbol in
+        write_market_data_snapshot ~id symbol exchange addr w ts t ;
+        Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
     end
   | _ ->
-    reject_market_data_request addr w
-      "Market Data Request: no symbol id, symbol or exchange provided"
+    reject_market_data_request addr w "Market Data Request: wrong request"
 
-let market_depth_accept
-    ~conn:{ Connection.addr ; w ; subs_depth }
-    ~req
-    ~bid:{ ts = bid_ts ; book = bid }
-    ~ask:{ ts = bid_ts ; book = ask }
-  =
-  (* OK because we sanitize before *******************************************)
-  let symbol_id = Option.value_exn req.DTC.Market_depth_request.symbol_id in
-  let symbol = Option.value_exn req.DTC.Market_depth_request.symbol in
-  let exchange = Option.value_exn req.DTC.Market_depth_request.exchange in
-  (****************************************************************************)
-  let bid_size = Float.Map.length bid in
-  let ask_size = Float.Map.length ask in
-  let num_levels = Option.value_map req.num_levels ~default:50 ~f:Int32.to_int_exn in
-  String.Table.set subs_depth symbol symbol_id;
+let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
+  let bid = Book.get_bids symbol in
+  let ask = Book.get_asks symbol in
+  let bid_size = Float.Map.length bid.book in
+  let ask_size = Float.Map.length ask.book in
   let snap = DTC.default_market_depth_snapshot_level () in
-  snap.symbol_id <- Some symbol_id ;
+  snap.symbol_id <- id ;
   snap.side <- Some `at_bid ;
   snap.is_last_message_in_batch <- Some false ;
   (* ignore @@ Float.Map.fold_right bid ~init:1 ~f:begin fun ~key:price ~data:qty lvl -> *)
@@ -728,35 +745,53 @@ let market_depth_accept
   Log.debug log_dtc "-> [%s] Market Depth Snapshot %s %s (%d/%d)"
     addr symbol exchange (Int.min bid_size num_levels) (Int.min ask_size num_levels)
 
-let market_depth_reject addr w symbol_id k = Printf.ksprintf begin fun reject_text ->
+let reject_market_depth_request ?id addr w k =
+  Printf.ksprintf begin fun reject_text ->
     let rej = DTC.default_market_depth_reject () in
-    rej.symbol_id <- Some symbol_id ;
+    rej.symbol_id <- id ;
     rej.reject_text <- Some reject_text ;
-    Log.debug log_dtc "-> [%s] Market Depth Reject: %ld %s"
-      addr symbol_id reject_text;
+    Log.debug log_dtc "-> [%s] Market Depth Reject: %s" addr reject_text;
     write_message w `market_depth_reject
       DTC.gen_market_depth_reject rej
   end k
 
 let market_depth_request addr w msg =
   let req = DTC.parse_market_depth_request msg in
-  let ({ Connection.subs_depth } as conn) = Connection.find_exn addr in
-  match req.symbol_id, req.symbol, req.exchange with
-  | Some symbol_id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Market Depth Request %s %s" addr symbol exchange ;
-    if req.request_action = Some `unsubscribe then
-      String.Table.remove subs_depth symbol
-    else if exchange <> my_exchange then
-      market_depth_reject addr w symbol_id "No such exchange %s" exchange
-    else if not String.Table.(mem tickers symbol) then
-      market_depth_reject addr w symbol_id "No such symbol %s" symbol
-    else begin match String.Table.(find bids symbol, find asks symbol) with
-      | Some bid, Some ask ->
-        market_depth_accept ~conn ~req ~bid ~ask
+  let num_levels = Option.value_map req.num_levels ~default:50 ~f:Int32.to_int_exn in
+  let { Connection.subs_depth ; rev_subs_depth } = Connection.find_exn addr in
+  match req.request_action,
+        req.symbol_id,
+        req.symbol,
+        req.exchange
+  with
+  | _, id, _, Some exchange when exchange <> my_exchange ->
+    reject_market_depth_request ?id addr w "No such exchange %s" exchange
+  | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
+    reject_market_data_request ?id addr w "No such symbol %s" symbol
+  | Some `unsubscribe, Some id, _, _ ->
+    begin match Int32.Table.find rev_subs_depth id with
+    | None -> ()
+    | Some symbol -> String.Table.remove subs_depth symbol
+    end ;
+    Int32.Table.remove rev_subs_depth id
+  | Some `snapshot, id, Some symbol, Some exchange ->
+    write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels
+  | Some `subscribe, Some id, Some symbol, Some exchange ->
+    Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
+      addr id symbol exchange ;
+    begin
+      match Int32.Table.find rev_subs_depth id with
+      | Some symbol' when symbol <> symbol' ->
+        reject_market_data_request addr w ~id
+          "Already subscribed to %s-%s with a different id (was %ld)"
+          symbol exchange id
       | _ ->
-        market_depth_reject addr w symbol_id "No orderbook for %s %s" symbol exchange
+        String.Table.set subs_depth symbol id ;
+        Int32.Table.set rev_subs_depth id symbol ;
+        write_market_depth_snapshot ~id addr w ~symbol ~exchange ~num_levels
     end
-  | _ -> ()
+  | _ ->
+    reject_market_data_request addr w "Market Data Request: wrong request"
 
 let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
