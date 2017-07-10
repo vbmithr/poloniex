@@ -1,5 +1,5 @@
-(executable
- ((name poloniex)
-  (public_name poloniex)
+(executables
+ ((names (poloniex poloniex_data))
+  (public_names (poloniex poloniex-data))
   (preprocess (pps (ppx_sexp_conv)))
-  (libraries (dtc-pb plnx-rest plnx-ws-new))))
+  (libraries (bs-devkit leveldb tick dtc-pb plnx-rest plnx-ws-new))))
