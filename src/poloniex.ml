@@ -386,22 +386,14 @@ let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts
 let int32_of_time ts = Int32.of_int64_exn (int64_of_time ts)
 
 let at_bid_or_ask_to_dtc : Side.t -> DTC.at_bid_or_ask_enum = function
-  | `Buy -> `at_bid
-  | `Sell -> `at_ask
+  | `buy -> `at_bid
+  | `sell -> `at_ask
+  | `buy_sell_unset -> `bid_ask_unset
 
 let at_bid_or_ask_of_dtc : DTC.at_bid_or_ask_enum -> Side.t = function
-  | `at_bid -> `Buy
-  | `at_ask -> `Sell
-  | _ -> invalid_arg "at_bid_or_ask_of_dtc"
-
-let buy_sell_to_dtc : Side.t -> DTC.buy_sell_enum = function
-  | `Buy -> `buy
-  | `Sell -> `sell
-
-let buy_sell_of_dtc : DTC.buy_sell_enum -> Side.t = function
-  | `buy -> `Buy
-  | `sell -> `Sell
-  | _ -> invalid_arg "buy_sell_of_dtc"
+  | `at_bid -> `buy
+  | `at_ask -> `sell
+  | `bid_ask_unset -> `buy_sell_unset
 
 let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
@@ -428,11 +420,12 @@ let on_book_updates pair ts updates =
   let asks = Book.get_asks pair in
   let fold_updates (bid, ask) { Plnx.Book.side; price; qty } =
     match side with
-    | `Buy ->
+    | `buy_sell_unset -> invalid_arg "on_book_updates: side unset"
+    | `buy ->
       (if qty > 0. then Float.Map.add bid ~key:price ~data:qty
        else Float.Map.remove bid price),
       ask
-    | `Sell ->
+    | `sell ->
       (if qty > 0. then Float.Map.add ask ~key:price ~data:qty
        else Float.Map.remove ask price),
       bid
@@ -815,7 +808,7 @@ let open_orders_request addr w msg =
       resp.server_order_id <- Some (Int.to_string id) ;
       resp.exchange_order_id <- Some (Int.to_string id) ;
       resp.order_type <- Some `order_type_limit ;
-      resp.buy_sell <- Some (buy_sell_to_dtc side) ;
+      resp.buy_sell <- Some side ;
       resp.price1 <- Some price ;
       resp.order_quantity <- Some starting_qty ;
       resp.filled_quantity <- Some (starting_qty -. qty) ;
@@ -890,7 +883,7 @@ let historical_order_fills addr w msg =
     resp.symbol <- Some symbol ;
     resp.exchange <- Some my_exchange ;
     resp.server_order_id <- Some (Int.to_string gid) ;
-    resp.buy_sell <- Some (buy_sell_to_dtc side) ;
+    resp.buy_sell <- Some side ;
     resp.price <- Some price ;
     resp.quantity <- Some qty ;
     resp.date_time <- Some (int64_of_time ts) ;
@@ -1014,7 +1007,7 @@ let submit_order_api ~c ~(req : DTC.submit_new_single_order) =
 
   (* OK to do this because req is normalized ************************)
   let symbol = Option.value_exn req.symbol in
-  let side = Option.value_exn req.buy_sell |> buy_sell_of_dtc in
+  let side = Option.value_exn req.buy_sell in
   let price = Option.value_exn req.price1 in
   let qty = Option.value_exn req.quantity in
   (******************************************************************)
