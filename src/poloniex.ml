@@ -113,7 +113,6 @@ let secdef_of_ticker ?request_id ?(final=true) t =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
-
 module Connection = struct
   type t = {
     addr: string;
@@ -142,6 +141,8 @@ module Connection = struct
   let find_exn = String.Table.find_exn active
   let set = String.Table.set active
   let remove = String.Table.remove active
+
+  let iter = String.Table.iter active
 
   let update_positions { addr; w; key; secret; positions } =
     let write_update ?(price=0.) ?(qty=0.) symbol =
@@ -345,15 +346,15 @@ let send_update_msgs depth symbol_id w ts (t:Ticker.t) (t':Ticker.t) =
     write_message w `market_data_update_session_high
       DTC.gen_market_data_update_session_high update
   end;
-  if t.last <> t'.last then begin
-    let float_of_ts ts = Time_ns.to_int_ns_since_epoch ts |> Float.of_int |> fun date -> date /. 1e9 in
-    let update = DTC.default_market_data_update_last_trade_snapshot () in
-    update.symbol_id <- Some symbol_id ;
-    update.last_trade_date_time <- Some (float_of_ts ts) ;
-    update.last_trade_price <- Some (t'.last) ;
-    write_message w `market_data_update_last_trade_snapshot
-      DTC.gen_market_data_update_last_trade_snapshot update
-  end;
+  (* if t.last <> t'.last then begin *)
+  (*   let float_of_ts ts = Time_ns.to_int_ns_since_epoch ts |> Float.of_int |> fun date -> date /. 1e9 in *)
+  (*   let update = DTC.default_market_data_update_last_trade_snapshot () in *)
+  (*   update.symbol_id <- Some symbol_id ; *)
+  (*   update.last_trade_date_time <- Some (float_of_ts ts) ; *)
+  (*   update.last_trade_price <- Some (t'.last) ; *)
+  (*   write_message w `market_data_update_last_trade_snapshot *)
+  (*     DTC.gen_market_data_update_last_trade_snapshot update *)
+  (* end; *)
   if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
     let update = DTC.default_market_data_update_bid_ask () in
     update.symbol_id <- Some symbol_id ;
@@ -363,7 +364,7 @@ let send_update_msgs depth symbol_id w ts (t:Ticker.t) (t':Ticker.t) =
       DTC.gen_market_data_update_bid_ask update
   end
 
-let on_ticker_update pair ts t t' =
+let on_ticker_update ts t t' =
   let send_secdef_msg w t =
     let secdef = secdef_of_ticker ~final:true t in
     write_message w `security_definition_response
@@ -371,15 +372,34 @@ let on_ticker_update pair ts t t' =
   let on_connection { Connection.addr; w; subs; subs_depth; send_secdefs } =
     let on_symbol_id ?(depth=false) symbol_id =
       send_update_msgs depth symbol_id w ts t t';
-      Log.debug log_dtc "-> [%s] %s TICKER" addr pair
+      Log.debug log_dtc "-> [%s] %s TICKER" addr t.symbol
     in
     if send_secdefs && phys_equal t t' then send_secdef_msg w t ;
-    match String.Table.(find subs pair, find subs_depth pair) with
+    match String.Table.(find subs t.symbol, find subs_depth t.symbol) with
     | Some sym_id, None -> on_symbol_id ~depth:false sym_id
     | Some sym_id, _ -> on_symbol_id ~depth:true sym_id
     | _ -> ()
   in
-  String.Table.iter Connection.active ~f:on_connection
+  Connection.iter ~f:on_connection
+
+let update_tickers () =
+  let now = Time_ns.now () in
+  Rest.tickers () >>| function
+  | Error err ->
+    Log.error log_plnx "get tickers: %s" (Rest.Http_error.to_string err)
+  | Ok ts ->
+    List.iter ts ~f:begin fun t ->
+      let old_ts, old_t =
+        String.Table.find_or_add tickers t.symbol ~default:(fun () -> (now, t)) in
+      String.Table.set tickers t.symbol (now, t) ;
+      on_ticker_update now old_t t ;
+    end
+
+let rec loop_update_tickers () =
+  Clock_ns.every
+    ~continue_on_error:true
+    (Time_ns.Span.of_int_sec 60)
+    (fun () -> don't_wait_for (update_tickers ()))
 
 let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
@@ -1024,9 +1044,9 @@ let submit_order_api ~c ~(req : DTC.submit_new_single_order) =
   order_f ~buf:buf_json ?tif ~key ~secret ~side ~symbol ~price ~qty () >>| function
   | Error Rest.Http_error.Poloniex msg ->
     reject_order ~c ~req "%s" msg
-  | Error _ ->
+  | Error err ->
     Option.iter req.client_order_id ~f:begin fun id ->
-      reject_order ~c ~req "unknown error when trying to submit %s" id
+      reject_order ~c ~req "%s: %s" id (Rest.Http_error.to_string err)
     end
   | Ok { id; trades; amount_unfilled } -> begin
       match trades, amount_unfilled with
@@ -1301,10 +1321,11 @@ let main update_client_span' heartbeat timeout tls port
     | Ok ts ->
       List.iter ts ~f:(fun t -> String.Table.set tickers t.symbol (now, t))
     end >>= fun () ->
+    loop_update_tickers () ;
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     Deferred.all_unit [
-      loop_log_errors ~log:log_dtc (fun () -> ws ?heartbeat timeout);
-      loop_log_errors ~log:log_dtc (fun () -> dtcserver ~server ~port)
+      loop_log_errors ~log:log_dtc (fun () -> ws ?heartbeat timeout) ;
+      loop_log_errors ~log:log_dtc (fun () -> dtcserver ~server ~port) ;
     ]
   end
 
