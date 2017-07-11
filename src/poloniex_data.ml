@@ -27,38 +27,41 @@ module CtrlFile = struct
   let with_file fn ~f =
     Unix.with_file fn ~mode:[`Rdwr] ~f:begin fun fd ->
       let unix_fd = Fd.file_descr_exn fd in
-      let bs = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 1024) in
+      let bs = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 8192) in
       f bs
     end
 
   let open_file fn =
     Unix.openfile fn ~mode:[`Creat ; `Rdwr] >>| fun fd ->
     let unix_fd = Fd.file_descr_exn fd in
-    let ba = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 1024) in
+    let ba = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 8192) in
     create ~fd ~ba
 
   let close { fd } = Fd.close fd
 
-  let beginning = Date.create_exn ~y:2017 ~m:Month.Jan ~d:1
+  let beginning =
+    let open Time_ns in
+    of_date_ofday
+      ~zone:Time.Zone.utc (Date.create_exn ~y:2017 ~m:Month.Jan ~d:1)
+      Ofday.start_of_day
 
   let jobs { ba } f =
-    let today = Date.today ~zone:Time.Zone.utc in
-    let days = Date.diff today beginning in
-    let thunks = ref [] in
-    for i = 0 to days - 1 do
-      let start_ts =
-        Time_ns.of_date_ofday
-          ~zone:Time.Zone.utc (Date.add_days beginning i) Time_ns.Ofday.start_of_day in
-      let end_ts =
-        Time_ns.of_date_ofday
-          ~zone:Time.Zone.utc (Date.add_days beginning i) Time_ns.Ofday.end_of_day in
-      if Bigarray.Array1.get ba i = 0 then
-        thunks := begin fun () -> f ~start_ts ~end_ts >>| function
-          | Error _ -> ()
-          | Ok _ -> Bigarray.Array1.set ba i 1
-        end :: !thunks
-    done ;
-    !thunks
+    let now_ts = Time_ns.now () in
+    let rec inner (i, start_ts, thunks) =
+      let end_ts = Time_ns.(add start_ts (Span.of_hr 1.)) in
+      let latest = Time_ns.(end_ts >= now_ts) in
+      let thunks =
+        begin
+          if Bigarray.Array1.get ba i = 0 || latest then
+            begin fun () -> f ~start_ts ~end_ts >>| function
+              | Error _ -> ()
+              | Ok _ -> Bigarray.Array1.set ba i 1
+            end :: thunks
+          else thunks
+        end in
+      if latest then thunks
+      else inner (succ i, end_ts, thunks)
+    in inner (0, beginning, [])
 end
 
 module Instrument = struct
@@ -222,9 +225,10 @@ let pump symbol ~start_ts ~end_ts =
       ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, last_ts) t ->
       store_trade_in_db symbol t ;
       succ nb_trades, t.ts
-    end >>| fun (nb_trades, last_ts) ->
+    end >>= fun (nb_trades, last_ts) ->
     debug "pumped %d trades from %s to %s" nb_trades
       (Time_ns.to_string start_ts) (Time_ns.to_string end_ts) ;
+    Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
     Ok ()
 
 (* A DTC Historical Price Server. *)
@@ -431,7 +435,8 @@ let dtcserver ~server ~port =
       Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk 0))
     end
   in
-  let on_handler_error_f addr = function
+  let on_handler_error_f addr exn =
+    match Monitor.extract_exn exn with
     | Exit -> ()
     | exn ->
       error "on_handler_error (%s): %s"
