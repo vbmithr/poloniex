@@ -16,23 +16,113 @@ module DB = struct
     put_tick ?sync db @@ Tick.create ~ts ~side ~p:price ~v:qty ()
 end
 
-let buf = Bi_outbuf.create 4096
+module CtrlFile = struct
+  type t = {
+    fd : Fd.t ;
+    ba : (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+  }
 
-let datadir = ref (Filename.concat "data" "poloniex")
+  let create ~fd ~ba = { fd ; ba }
+
+  let with_file fn ~f =
+    Unix.with_file fn ~mode:[`Rdwr] ~f:begin fun fd ->
+      let unix_fd = Fd.file_descr_exn fd in
+      let bs = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 1024) in
+      f bs
+    end
+
+  let open_file fn =
+    Unix.openfile fn ~mode:[`Creat ; `Rdwr] >>| fun fd ->
+    let unix_fd = Fd.file_descr_exn fd in
+    let ba = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 1024) in
+    create ~fd ~ba
+
+  let close { fd } = Fd.close fd
+
+  let beginning = Date.create_exn ~y:2017 ~m:Month.Jan ~d:1
+
+  let jobs { ba } f =
+    let today = Date.today ~zone:Time.Zone.utc in
+    let days = Date.diff today beginning in
+    let thunks = ref [] in
+    for i = 0 to days - 1 do
+      let start_ts =
+        Time_ns.of_date_ofday
+          ~zone:Time.Zone.utc (Date.add_days beginning i) Time_ns.Ofday.start_of_day in
+      let end_ts =
+        Time_ns.of_date_ofday
+          ~zone:Time.Zone.utc (Date.add_days beginning i) Time_ns.Ofday.end_of_day in
+      if Bigarray.Array1.get ba i = 0 then
+        thunks := begin fun () -> f ~start_ts ~end_ts >>| function
+          | Error _ -> ()
+          | Ok _ -> Bigarray.Array1.set ba i 1
+        end :: !thunks
+    done ;
+    !thunks
+end
+
+module Instrument = struct
+  type t = {
+    db : DB.db ;
+    ctrl : CtrlFile.t ;
+  }
+
+  let create ~db ~ctrl = { db ; ctrl }
+
+  let datadir = ref (Filename.concat "data" "poloniex")
+  let set_datadir d = datadir := d
+
+  let db_path symbol =
+    Filename.concat !datadir symbol
+
+  let load symbols_in_use =
+    Deferred.Result.bind
+      (REST.symbols ~log:(Lazy.force log) ())
+      ~f:begin fun all_symbols ->
+        let symbols_in_use =
+          String.Set.(inter (of_list all_symbols) (of_list symbols_in_use) |> to_list) in
+        Deferred.List.map
+          ~how:`Sequential symbols_in_use ~f:begin fun symbol ->
+          let db = DB.open_db (db_path symbol) in
+          CtrlFile.open_file symbol >>| fun ctrl ->
+          info "Loaded instrument %s" symbol ;
+          symbol, create ~db ~ctrl
+        end >>| fun res -> Ok res
+      end
+
+  let active : t String.Table.t = String.Table.create ()
+  let find = String.Table.find active
+  let find_exn = String.Table.find_exn active
+
+  let load symbols_in_use =
+    Deferred.Result.map (load symbols_in_use) ~f:begin fun instruments ->
+      List.iter instruments ~f:begin fun (symbol, i) ->
+        String.Table.add_exn active symbol i
+      end
+    end
+
+  let thunks_exn symbol f =
+    let { ctrl } = find_exn symbol in
+    CtrlFile.jobs ctrl f
+
+  let close { db ; ctrl } =
+    DB.close db ;
+    CtrlFile.close ctrl
+
+  let shutdown () =
+    String.Table.to_alist active |>
+    Deferred.List.iter ~how:`Parallel ~f:(fun (_, i) -> close i) >>| fun () ->
+    info "Saved %d dbs" @@ String.Table.length active ;
+end
+
 let dry_run = ref false
-
-let db_path symbol =
-  Filename.concat !datadir symbol
-
-let dbs = String.Table.create ()
 
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
   fun symbol { Trade.ts; price; qty; side } ->
     if !dry_run || side = `buy_sell_unset then ()
     else
-      let db = String.Table.find_or_add dbs symbol
-          ~default:(fun () -> DB.open_db @@ db_path symbol) in
+      let { Instrument.db } = Instrument.find_exn symbol in
       let ts = match String.Table.find tss symbol with
         | None ->
           String.Table.add_exn tss symbol (ts, 0); ts
@@ -124,17 +214,18 @@ module Granulator = struct
       end
 end
 
-let rec pump start_ts symbol =
-  let trades = REST.all_trades ~start_ts ~log:(Lazy.force log) symbol in
-  Pipe.fold_without_pushback trades
-    ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, last_ts) t ->
-    store_trade_in_db symbol t ;
-    succ nb_trades, t.ts
-  end >>| fun (nb_trades, last_ts) ->
-  let last_ts_str = Time_ns.to_string last_ts in
-  debug "pumped %d trades up to to %s" nb_trades last_ts_str ;
-  if not !dry_run then
-    Out_channel.write_all (db_path ("start_" ^ symbol)) ~data:last_ts_str
+let pump symbol ~start_ts ~end_ts =
+  REST.trades ~log:(Lazy.force log) ~start_ts ~end_ts symbol >>= function
+  | Error err -> return (Error err)
+  | Ok trades ->
+    Pipe.fold_without_pushback trades
+      ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, last_ts) t ->
+      store_trade_in_db symbol t ;
+      succ nb_trades, t.ts
+    end >>| fun (nb_trades, last_ts) ->
+    debug "pumped %d trades from %s to %s" nb_trades
+      (Time_ns.to_string start_ts) (Time_ns.to_string end_ts) ;
+    Ok ()
 
 (* A DTC Historical Price Server. *)
 
@@ -283,13 +374,13 @@ let historical_price_data_request addr w msg =
       w req "Symbol not specified" ;
     raise Exit
   | Some symbol, _ ->
-    match String.Table.find dbs symbol with
+    match Instrument.find symbol with
     | None ->
       reject_historical_price_data_request
         ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
         w req "No such symbol" ;
       raise Exit
-    | Some db -> don't_wait_for begin
+    | Some { db } -> don't_wait_for begin
         In_thread.run begin fun () ->
           accept_historical_price_data_request w req db symbol span
         end >>| fun (nb_streamed, nb_processed) ->
@@ -350,55 +441,35 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let load_instruments () =
-  REST.symbols ~buf ~log:(Lazy.force log) () >>|
-  Result.map ~f:begin fun symbols ->
-    List.map symbols ~f:begin fun key ->
-      String.Table.add_exn dbs ~key ~data:(DB.open_db @@ db_path key);
-      info "Opened DB %s" key ;
-      key
-    end
-  end
-
-let start_ts_of_symbol ?start symbol =
-  match start with
-  | Some days -> Time_ns.(sub (now ()) (Span.of_day days))
-  | None ->
-    try Time_ns.of_string @@ In_channel.read_all @@ db_path ("start_" ^ symbol)
-    with exn ->
-      error "Unable to read start file, using epoch %s" (Exn.to_string exn) ;
-      Time_ns.epoch
-
 let run ?start port no_pump symbols_in_use =
-  load_instruments () >>= function
+  Instrument.load symbols_in_use >>= function
   | Error err ->
     error "%s" (REST.Http_error.to_string err) ;
     Deferred.unit
-  | Ok all_symbols ->
-    let symbols_in_use =
-      String.Set.(inter (of_list all_symbols) (of_list symbols_in_use) |> to_list) in
+  | Ok () ->
     info "Data server starting";
     dtcserver ~server:`TCP ~port >>= fun server ->
     Deferred.all_unit [
       Tcp.Server.close_finished server ;
       if no_pump then Deferred.unit
       else
-        Deferred.List.iter ~how:`Sequential symbols_in_use ~f:begin fun symbol ->
-          let start_ts = start_ts_of_symbol ?start symbol in
-          pump start_ts symbol
-        end
+        let thunks = List.fold symbols_in_use ~init:[] ~f:begin fun a symbol ->
+          List.rev_append (Instrument.thunks_exn symbol (pump symbol)) a
+        end in
+        Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
 
-let main dry_run' no_pump start port daemon datadir' pidfile logfile loglevel symbols () =
+let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel symbols () =
   dry_run := dry_run';
-  datadir := datadir';
+  Instrument.set_datadir datadir ;
   set_level @@ loglevel_of_int loglevel;
   if daemon then Daemon.daemonize ~cd:"." ();
   Signal.handle Signal.terminating ~f:begin fun _ ->
     info "Data server stopping";
-    String.Table.iter dbs ~f:DB.close;
-    info "Saved %d dbs" @@ String.Table.length dbs;
-    don't_wait_for @@ Shutdown.exit 0
+    don't_wait_for begin
+      Instrument.shutdown () >>= fun () ->
+      Shutdown.exit 0
+    end
   end ;
   stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
