@@ -618,9 +618,9 @@ let security_definition_request addr w msg =
     | _ -> ()
 
 let reject_market_data_request ?id addr w k =
+  let rej = DTC.default_market_data_reject () in
+  rej.symbol_id <- id ;
   Printf.ksprintf begin fun reject_text ->
-    let rej = DTC.default_market_data_reject () in
-    rej.symbol_id <- id ;
     rej.reject_text <- Some reject_text ;
     Log.debug log_dtc "-> [%s] Market Data Reject: %s" addr reject_text;
     write_message w `market_data_reject DTC.gen_market_data_reject rej
@@ -739,9 +739,9 @@ let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
     addr symbol exchange (Int.min bid_size num_levels) (Int.min ask_size num_levels)
 
 let reject_market_depth_request ?id addr w k =
+  let rej = DTC.default_market_depth_reject () in
+  rej.symbol_id <- id ;
   Printf.ksprintf begin fun reject_text ->
-    let rej = DTC.default_market_depth_reject () in
-    rej.symbol_id <- id ;
     rej.reject_text <- Some reject_text ;
     Log.debug log_dtc "-> [%s] Market Depth Reject: %s" addr reject_text;
     write_message w `market_depth_reject
@@ -958,20 +958,20 @@ let reject_order
     ~(req : DTC.submit_new_single_order)
     k =
   let update = DTC.default_order_update () in
+  update.client_order_id <- req.client_order_id ;
+  update.symbol <- req.symbol ;
+  update.exchange <- req.exchange ;
+  update.order_status <- Some `order_status_rejected ;
+  update.order_update_reason <- Some `new_order_rejected ;
+  update.buy_sell <- req.buy_sell ;
+  update.price1 <- req.price1 ;
+  update.price2 <- req.price2 ;
+  update.time_in_force <- req.time_in_force ;
+  update.good_till_date_time <- req.good_till_date_time ;
+  update.free_form_text <- req.free_form_text ;
+  update.open_or_close <- req.open_or_close ;
   Printf.ksprintf begin fun info_text ->
-    update.client_order_id <- req.client_order_id ;
-    update.symbol <- req.symbol ;
-    update.exchange <- req.exchange ;
-    update.order_status <- Some `order_status_rejected ;
-    update.order_update_reason <- Some `new_order_rejected ;
     update.info_text <- Some info_text ;
-    update.buy_sell <- req.buy_sell ;
-    update.price1 <- req.price1 ;
-    update.price2 <- req.price2 ;
-    update.time_in_force <- req.time_in_force ;
-    update.good_till_date_time <- req.good_till_date_time ;
-    update.free_form_text <- req.free_form_text ;
-    update.open_or_close <- req.open_or_close ;
     write_message w `order_update DTC.gen_order_update update
   end k
 
@@ -1113,13 +1113,13 @@ let reject_cancel_order
     ~(req : DTC.cancel_order)
     k =
   let update = DTC.default_order_update () in
+  update.message_number <- Some 1l ;
+  update.total_num_messages <- Some 1l ;
+  update.client_order_id <- req.client_order_id ;
+  update.server_order_id <- req.server_order_id ;
+  update.order_status <- Some `order_status_open ;
+  update.order_update_reason <- Some `order_cancel_rejected ;
   Printf.ksprintf begin fun info_text ->
-    update.message_number <- Some 1l ;
-    update.total_num_messages <- Some 1l ;
-    update.client_order_id <- req.client_order_id ;
-    update.server_order_id <- req.server_order_id ;
-    update.order_status <- Some `order_status_open ;
-    update.order_update_reason <- Some `order_cancel_rejected ;
     update.info_text <- Some info_text ;
     write_message w `order_update DTC.gen_order_update update
   end k
@@ -1151,21 +1151,21 @@ let reject_cancel_replace_order
   let price2 =
     if Option.value ~default:false req.price2_is_set then req.price2 else None in
   let update = DTC.default_order_update () in
+  update.client_order_id <- req.client_order_id ;
+  update.server_order_id <- req.server_order_id ;
+  update.order_status <- Some `order_status_open ;
+  update.order_update_reason <- Some `order_cancel_replace_rejected ;
+  update.message_number <- Some 1l ;
+  update.total_num_messages <- Some 1l ;
+  update.exchange <- Some my_exchange ;
+  update.price1 <- price1 ;
+  update.price2 <- price2 ;
+  update.order_quantity <- req.quantity ;
+  update.time_in_force <- req.time_in_force ;
+  update.good_till_date_time <- req.good_till_date_time ;
   Printf.ksprintf begin fun info_text ->
     Log.debug log_dtc "-> [%s] Cancel Replace Reject: %s" addr info_text ;
-    update.client_order_id <- req.client_order_id ;
-    update.server_order_id <- req.server_order_id ;
-    update.order_status <- Some `order_status_open ;
-    update.order_update_reason <- Some `order_cancel_replace_rejected ;
     update.info_text <- Some info_text ;
-    update.message_number <- Some 1l ;
-    update.total_num_messages <- Some 1l ;
-    update.exchange <- Some my_exchange ;
-    update.price1 <- price1 ;
-    update.price2 <- price2 ;
-    update.order_quantity <- req.quantity ;
-    update.time_in_force <- req.time_in_force ;
-    update.good_till_date_time <- req.good_till_date_time ;
     write_message w `order_update DTC.gen_order_update update
   end k
 
