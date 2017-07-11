@@ -1088,7 +1088,12 @@ let submit_new_single_order
   end ;
   begin match Option.value ~default:`order_type_unset req.order_type, req.price1 with
     | `order_type_market, _ ->
-      req.price1 <- Some Float.max_value
+      req.price1 <-
+        Option.bind req.symbol ~f:begin fun symbol ->
+          Option.map (String.Table.find tickers symbol) ~f:begin fun (ts, t) ->
+            t.high24h *. 2.
+          end
+        end
     | `order_type_limit, Some price ->
       req.price1 <- Some price
     | `order_type_limit, None ->
