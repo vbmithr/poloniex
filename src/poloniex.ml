@@ -536,11 +536,13 @@ let heartbeat addr w ival =
   let msg = DTC.default_heartbeat () in
   let rec loop () =
     Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    let { Connection.dropped } = Connection.find_exn addr in
-    Log.debug log_dtc "-> [%s] Heartbeat" addr;
-    msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
-    write_message w `heartbeat DTC.gen_heartbeat msg ;
-    loop ()
+    match Connection.find addr with
+    | None -> Deferred.unit
+    | Some { Connection.dropped } ->
+      Log.debug log_dtc "-> [%s] Heartbeat" addr;
+      msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
+      write_message w `heartbeat DTC.gen_heartbeat msg ;
+      loop ()
   in
   loop ()
 
