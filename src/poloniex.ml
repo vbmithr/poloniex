@@ -113,6 +113,82 @@ let secdef_of_ticker ?request_id ?(final=true) t =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
+module RestSync : sig
+  type t
+
+  val create : unit -> t
+
+  val push : t -> (unit -> unit Deferred.t) -> unit Deferred.t
+  val push_nowait : t -> (unit -> unit Deferred.t) -> unit
+
+  val run : t -> unit
+
+  val start : t -> unit
+  val stop : t -> unit
+
+  val is_running : t -> bool
+
+  module Default : sig
+    val push : (unit -> unit Deferred.t) -> unit Deferred.t
+    val push_nowait : (unit -> unit Deferred.t) -> unit
+    val run : unit -> unit
+    val start : unit -> unit
+    val stop : unit -> unit
+    val is_running : unit -> bool
+  end
+end = struct
+  type t = {
+    r : (unit -> unit Deferred.t) Pipe.Reader.t ;
+    w : (unit -> unit Deferred.t) Pipe.Writer.t ;
+    mutable run : bool ;
+    condition : unit Condition.t ;
+  }
+
+  let create () =
+    let r, w = Pipe.create () in
+    let condition = Condition.create () in
+    { r ; w ; run = true ; condition }
+
+  let push { w } thunk =
+    Pipe.write w thunk
+
+  let push_nowait { w } thunk =
+    Pipe.write_without_pushback w thunk
+
+  let run { r ; run ; condition } =
+    let rec inner () =
+      if run then
+        Pipe.read r >>= function
+        | `Eof -> Deferred.unit
+        | `Ok thunk ->
+          thunk () >>=
+          inner
+      else
+        Condition.wait condition >>=
+        inner
+    in
+    don't_wait_for (inner ())
+
+  let start t =
+    t.run <- true ;
+    Condition.signal t.condition ()
+
+  let stop t = t.run <- false
+  let is_running { run } = run
+
+  module Default = struct
+    let default = create ()
+
+    let push thunk = push default thunk
+    let push_nowait thunk = push_nowait default thunk
+
+    let run () = run default
+    let start () = start default
+    let stop () = stop default
+    let is_running () = is_running default
+  end
+end
+
 module Connection = struct
   type t = {
     addr: string;
@@ -208,7 +284,7 @@ module Connection = struct
   let update_trades_loop ?start conn span =
     Clock_ns.every
       ?start ~stop:(Writer.close_started conn.w) ~continue_on_error:true span
-      (fun () -> don't_wait_for @@ update_trades conn)
+      (fun () -> RestSync.Default.push_nowait (fun () -> update_trades conn))
 
   let write_margin_balance
       ?request_id
@@ -287,7 +363,7 @@ module Connection = struct
     Clock_ns.every
       ?start ~stop:(Writer.close_started conn.w)
       ~continue_on_error:true span
-      (fun () -> don't_wait_for @@ update_balances conn)
+      (fun () -> RestSync.Default.push_nowait (fun () -> update_balances conn))
 
   let update_connection conn span =
     update_trades_loop conn span;
@@ -319,7 +395,7 @@ module Connection = struct
       Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
       | Error _ -> false
       | Ok _ ->
-        update_connection conn !update_client_span;
+        update_connection conn !update_client_span ;
         true
     end
 end
@@ -399,7 +475,7 @@ let rec loop_update_tickers () =
   Clock_ns.every
     ~continue_on_error:true
     (Time_ns.Span.of_int_sec 60)
-    (fun () -> don't_wait_for (update_tickers ()))
+    (fun () -> RestSync.Default.push_nowait update_tickers)
 
 let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
@@ -598,17 +674,16 @@ let logon_request addr w msg =
   in
   begin match req.username, req.password, int2 with
     | Some key, Some secret, 0l ->
-      don't_wait_for begin
+      RestSync.Default.push_nowait begin fun () ->
         Connection.setup ~addr ~w ~key ~secret ~send_secdefs >>| function
         | true -> accept @@ Result.return "Valid Poloniex credentials"
         | false -> accept @@ Result.fail "Invalid Poloniex crendentials"
       end
     | _ ->
-      don't_wait_for begin
-        Deferred.ignore @@
-        Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs
-      end ;
-      accept @@ Result.fail "No credentials"
+      RestSync.Default.push_nowait begin fun () ->
+        Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs >>| fun _ ->
+        accept @@ Result.fail "No credentials"
+      end
   end
 
 let heartbeat addr w msg = Log.debug log_dtc "<- [%s] Heartbeat" addr
@@ -1122,7 +1197,7 @@ let submit_new_single_order
       reject_order ~c ~req "Unsupported order type" ;
       raise Exit
   end ;
-  don't_wait_for (submit_order ~c ~req)
+  RestSync.Default.push_nowait (fun () -> submit_order ~c ~req)
 
 let submit_new_single_order addr w msg =
   let c = Connection.find_exn addr in
@@ -1212,7 +1287,7 @@ let cancel_replace_order addr w msg =
         "Order modify without setting a price is not supported by Poloniex"
     | Some order_id, Some price ->
       let qty = Option.map req.quantity ~f:(( *. ) 1e-4) in
-      don't_wait_for begin
+      RestSync.Default.push_nowait begin fun () ->
         Rest.modify_order ~key:c.key ~secret:c.secret ?qty ~price ~order_id () >>| function
         | Error Rest.Http_error.Poloniex msg ->
           reject_cancel_replace_order ~c ~req "cancel order %d failed: %s" order_id msg
@@ -1320,6 +1395,7 @@ let main update_client_span' heartbeat timeout tls port
     | Ok ts ->
       List.iter ts ~f:(fun t -> String.Table.set tickers t.symbol (now, t))
     end >>= fun () ->
+    RestSync.Default.run () ;
     loop_update_tickers () ;
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     Deferred.all_unit [
