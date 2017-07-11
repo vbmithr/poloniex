@@ -1022,15 +1022,12 @@ let send_order_update
   write_message w `order_update DTC.gen_order_update update
 
 (* req argument is normalized. *)
-let submit_order_api ~c ~(req : DTC.submit_new_single_order) =
+let submit_order ~c ~(req : DTC.submit_new_single_order) =
   let { Connection.w ; key ; secret } = c in
-
-  (* OK to do this because req is normalized ************************)
   let symbol = Option.value_exn req.symbol in
-  let side = Option.value_exn req.buy_sell in
+  let side = Option.value_exn ~message:"submit_order: side" req.buy_sell in
   let price = Option.value_exn req.price1 in
-  let qty = Option.value_exn req.quantity in
-  (******************************************************************)
+  let qty = Option.value_map req.quantity ~default:0. ~f:(( *. ) 1e-4) in
   let margin = margin_enabled symbol in
   let tif = match req.time_in_force with
     | Some `tif_fill_or_kill -> Some `Fill_or_kill
@@ -1038,8 +1035,8 @@ let submit_order_api ~c ~(req : DTC.submit_new_single_order) =
     | _ -> None
   in
   let order_f =
-    if margin then Rest.margin_order ?max_lending_rate:None
-    else Rest.order
+    if margin then Rest.submit_margin_order ?max_lending_rate:None
+    else Rest.submit_order
   in
   order_f ~buf:buf_json ?tif ~key ~secret ~side ~symbol ~price ~qty () >>| function
   | Error Rest.Http_error.Poloniex msg ->
@@ -1123,7 +1120,7 @@ let submit_new_single_order
       reject_order ~c ~req "Unsupported order type" ;
       raise Exit
   end ;
-  don't_wait_for (submit_order_api ~c ~req)
+  don't_wait_for (submit_order ~c ~req)
 
 let submit_new_single_order addr w msg =
   let c = Connection.find_exn addr in
@@ -1212,9 +1209,9 @@ let cancel_replace_order addr w msg =
       reject_cancel_replace_order ~c ~req
         "Order modify without setting a price is not supported by Poloniex"
     | Some order_id, Some price ->
+      let qty = Option.map req.quantity ~f:(( *. ) 1e-4) in
       don't_wait_for begin
-        Rest.modify_order ?qty:req.quantity
-          ~key:c.key ~secret:c.secret ~price ~order_id () >>| function
+        Rest.modify_order ~key:c.key ~secret:c.secret ?qty ~price ~order_id () >>| function
         | Error Rest.Http_error.Poloniex msg ->
           reject_cancel_replace_order ~c ~req "cancel order %d failed: %s" order_id msg
         | Error _ ->
