@@ -9,14 +9,16 @@ module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
 let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
+  if Writer.is_open w then begin
+    let typ =
+      Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
+    let msg = (gen msg |> Piqirun.to_string) in
+    let header = Bytes.create 4 in
+    Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
+    Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
+    Writer.write w header ;
+    Writer.write w msg
+  end
 
 let rec loop_log_errors ?log f =
   let rec inner () =
@@ -40,7 +42,7 @@ let conduit_server ~tls ~crt_path ~key_path =
 let my_exchange = "PLNX"
 let exchange_account = "exchange"
 let margin_account = "margin"
-let update_client_span = ref @@ Time_ns.Span.of_int_sec 10
+let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
 let sc_mode = ref false
 
 let log_plnx =
@@ -220,19 +222,19 @@ module Connection = struct
 
   let iter = String.Table.iter active
 
+  let write_position_update ?(price=0.) ?(qty=0.) w symbol =
+    let update = DTC.default_position_update () in
+    update.trade_account <- Some margin_account ;
+    update.total_number_messages <- Some 1l ;
+    update.message_number <- Some 1l ;
+    update.symbol <- Some symbol ;
+    update.exchange <- Some my_exchange ;
+    update.quantity <- Some qty ;
+    update.average_price <- Some price ;
+    update.unsolicited <- Some true ;
+    write_message w `position_update DTC.gen_position_update update
+
   let update_positions { addr; w; key; secret; positions } =
-    let write_update ?(price=0.) ?(qty=0.) symbol =
-      let update = DTC.default_position_update () in
-      update.trade_account <- Some margin_account ;
-      update.total_number_messages <- Some 1l ;
-      update.message_number <- Some 1l ;
-      update.symbol <- Some symbol ;
-      update.exchange <- Some my_exchange ;
-      update.quantity <- Some qty ;
-      update.average_price <- Some price ;
-      update.unsolicited <- Some true ;
-      write_message w `position_update DTC.gen_position_update update
-    in
     Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
       Log.error log_plnx "update positions (%s): %s"
@@ -241,50 +243,40 @@ module Connection = struct
         match p with
         | None ->
           String.Table.remove positions symbol ;
-          write_update symbol
+          write_position_update w symbol
         | Some ({ price; qty; total; pl; lending_fees; side } as p) ->
           String.Table.set positions ~key:symbol ~data:p ;
-          write_update ~price ~qty symbol
+          write_position_update w symbol ~price ~qty:(qty *. 1e4)
       end
 
-  let update_orders { key; secret; orders } =
-    Rest.open_orders ~buf:buf_json ~key ~secret () >>|
-    Result.map ~f:begin fun os ->
+  let update_orders { addr ; key; secret; orders } =
+    Rest.open_orders ~buf:buf_json ~key ~secret () >>| function
+    | Error err ->
+      Log.error log_plnx
+        "update orders (%s): %s" addr @@ Rest.Http_error.to_string err
+    | Ok os ->
       Int.Table.clear orders;
       List.iter os ~f:begin fun (symbol, os) ->
         List.iter os ~f:begin fun o ->
           Int.Table.set orders o.Rest.OpenOrders.id (symbol, o)
         end
       end
-    end
 
-  let update_trades ({ addr; w; key; secret; trades } as conn) =
-    Rest.trade_history ~buf:buf_json ~key ~secret () >>= function
+  let update_trades { addr; key; secret; trades } =
+    Rest.trade_history ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
-      return @@ Log.error log_plnx "update trades (%s): %s"
-        addr @@ Rest.Http_error.to_string err
+      Log.error log_plnx
+        "update trades (%s): %s" addr (Rest.Http_error.to_string err)
     | Ok ts ->
-      update_positions conn >>= fun () ->
-      Clock_ns.after Time_ns.Span.(of_int_ms 50) >>= fun () ->
-      update_orders conn >>| function
-      | Error err ->
-        Log.error log_plnx "update orders (%s): %s"
-          addr @@ Rest.Http_error.to_string err
-      | Ok () ->
-        List.iter ts ~f:begin fun (symbol, ts) ->
-          let old_ts =
-            String.Table.find trades symbol |>
-            Option.value ~default:Rest.TradeHistory.Set.empty in
-          let cur_ts = Rest.TradeHistory.Set.of_list ts in
-          let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
-          String.Table.set trades symbol cur_ts;
-          Rest.TradeHistory.Set.iter new_ts ~f:ignore (* TODO: send order update messages *)
-        end
-
-  let update_trades_loop ?start conn span =
-    Clock_ns.every
-      ?start ~stop:(Writer.close_started conn.w) ~continue_on_error:true span
-      (fun () -> RestSync.Default.push_nowait (fun () -> update_trades conn))
+      List.iter ts ~f:begin fun (symbol, ts) ->
+        let old_ts =
+          String.Table.find trades symbol |>
+          Option.value ~default:Rest.TradeHistory.Set.empty in
+        let cur_ts = Rest.TradeHistory.Set.of_list ts in
+        let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
+        String.Table.set trades symbol cur_ts;
+        Rest.TradeHistory.Set.iter new_ts ~f:ignore (* TODO: send order update messages *)
+      end
 
   let write_margin_balance
       ?request_id
@@ -333,42 +325,46 @@ module Connection = struct
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr exchange_account msg_number nb_msgs
 
-  let update_balances ({ addr; w; key; secret; b_exchange; b_margin } as conn) =
-    Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| begin function
-    | Error err -> Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
-    | Ok m -> conn.margin <- m
-    end >>= fun () ->
-    Clock_ns.after Time_ns.Span.(of_int_ms 50) >>= fun () ->
-    Rest.positive_balances ~buf:buf_json ~key ~secret () >>| begin function
+  let update_margin ({ key ; secret } as conn) =
+    Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
+    | Error err ->
+      Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
+    | Ok m ->
+      conn.margin <- m
+
+  let update_positive_balances ({ key ; secret ; b_margin } as conn) =
+    Rest.positive_balances ~buf:buf_json ~key ~secret () >>| function
     | Error err -> Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
     | Ok bs ->
       String.Table.clear b_margin;
       List.Assoc.find ~equal:(=) bs Margin |>
-      Option.iter ~f:begin List.iter ~f:begin fun (c, b) ->
-          String.Table.add_exn b_margin c b
-        end
-      end
-    end >>= fun () ->
-    Clock_ns.after Time_ns.Span.(of_int_ms 50) >>= fun () ->
-    Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>| begin function
+      Option.iter ~f:begin
+        List.iter ~f:(fun (c, b) -> String.Table.add_exn b_margin c b)
+      end ;
+      write_margin_balance conn
+
+  let update_balances ({ key ; secret ; b_exchange } as conn) =
+    Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>| function
     | Error err -> Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
     | Ok bs ->
       String.Table.clear b_exchange;
-      List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange c b)
-    end >>| fun () ->
-    write_exchange_balance conn;
-    write_margin_balance conn
-
-  let update_balances_loop ?start conn span =
-    Clock_ns.every
-      ?start ~stop:(Writer.close_started conn.w)
-      ~continue_on_error:true span
-      (fun () -> RestSync.Default.push_nowait (fun () -> update_balances conn))
+      List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange c b) ;
+      write_exchange_balance conn
 
   let update_connection conn span =
-    update_trades_loop conn span;
-    update_balances_loop conn span
-      ~start:Clock_ns.(after @@ Time_ns.Span.of_int_ms 1000)
+    Clock_ns.every
+      ~stop:(Writer.close_started conn.w)
+      ~continue_on_error:true
+      span
+      begin fun () ->
+        let open RestSync.Default in
+        push_nowait (fun () -> update_positions conn) ;
+        push_nowait (fun () -> update_orders conn) ;
+        push_nowait (fun () -> update_trades conn) ;
+        push_nowait (fun () -> update_margin conn) ;
+        push_nowait (fun () -> update_positive_balances conn) ;
+        push_nowait (fun () -> update_balances conn) ;
+      end
 
   let setup ~addr ~w ~key ~secret ~send_secdefs =
     let conn = {
@@ -504,8 +500,8 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
       update.date_time <- Some (float_of_time ts) ;
       write_message w `market_data_update_trade
         DTC.gen_market_data_update_trade update ;
-      Log.debug log_dtc "-> [%s] %s T %s"
-        addr pair (Sexplib.Sexp.to_string (Trade.sexp_of_t t));
+      (* Log.debug log_dtc "-> [%s] %s T %s" *)
+      (*   addr pair (Sexplib.Sexp.to_string (Trade.sexp_of_t t)); *)
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
@@ -883,6 +879,30 @@ let market_depth_request addr w msg =
   | _ ->
     reject_market_data_request addr w "Market Data Request: wrong request"
 
+let send_open_order_update w request_id nb_open_orders
+    ~key:_ ~data:(symbol, { Rest.OpenOrders.id; side; price; qty; starting_qty; } ) i =
+  let resp = DTC.default_order_update () in
+  let status = if qty = starting_qty then
+      `order_status_open else `order_status_partially_filled in
+  resp.request_id <- Some request_id ;
+  resp.total_num_messages <- Some (Int32.of_int_exn nb_open_orders) ;
+  resp.message_number <- Some i ;
+  resp.order_status <- Some status ;
+  resp.order_update_reason <- Some `open_orders_request_response ;
+  resp.symbol <- Some symbol ;
+  resp.exchange <- Some my_exchange ;
+  resp.server_order_id <- Some (Int.to_string id) ;
+  resp.exchange_order_id <- Some (Int.to_string id) ;
+  resp.order_type <- Some `order_type_limit ;
+  resp.buy_sell <- Some side ;
+  resp.price1 <- Some price ;
+  resp.order_quantity <- Some (starting_qty *. 1e4) ;
+  resp.filled_quantity <- Some ((starting_qty -. qty) *. 1e4) ;
+  resp.remaining_quantity <- Some (qty *. 1e4) ;
+  resp.time_in_force <- Some `tif_good_till_canceled ;
+  write_message w `order_update DTC.gen_order_update resp ;
+  Int32.succ i
+
 let open_orders_request addr w msg =
   let req = DTC.parse_open_orders_request msg in
   match req.request_id with
@@ -890,31 +910,8 @@ let open_orders_request addr w msg =
     let { Connection.orders } = Connection.find_exn addr in
     Log.debug log_dtc "<- [%s] Open Orders Request %ld" addr request_id ;
     let nb_open_orders = Int.Table.length orders in
-    let send_order_update
-        ~key:_ ~data:(symbol, { Rest.OpenOrders.id; side; price; qty; starting_qty; } ) i =
-      let resp = DTC.default_order_update () in
-      let status = if qty = starting_qty then
-          `order_status_open else `order_status_partially_filled in
-      resp.request_id <- Some request_id ;
-      resp.total_num_messages <- Some (Int32.of_int_exn nb_open_orders) ;
-      resp.message_number <- Some i ;
-      resp.order_status <- Some status ;
-      resp.order_update_reason <- Some `open_orders_request_response ;
-      resp.symbol <- Some symbol ;
-      resp.exchange <- Some my_exchange ;
-      resp.server_order_id <- Some (Int.to_string id) ;
-      resp.exchange_order_id <- Some (Int.to_string id) ;
-      resp.order_type <- Some `order_type_limit ;
-      resp.buy_sell <- Some side ;
-      resp.price1 <- Some price ;
-      resp.order_quantity <- Some starting_qty ;
-      resp.filled_quantity <- Some (starting_qty -. qty) ;
-      resp.remaining_quantity <- Some qty ;
-      resp.time_in_force <- Some `tif_good_till_canceled ;
-      write_message w `order_update DTC.gen_order_update resp ;
-      Int32.succ i
-    in
-    let (_:Int32.t) = Int.Table.fold orders ~init:1l ~f:send_order_update in
+    let (_:Int32.t) = Int.Table.fold orders
+        ~init:1l ~f:(send_open_order_update w request_id nb_open_orders) in
     if nb_open_orders = 0 then begin
       let resp = DTC.default_order_update () in
       resp.total_num_messages <- Some 1l ;
@@ -1027,28 +1024,29 @@ let trade_account_request addr w msg =
       addr trade_account msg_number nb_msgs
   end
 
+let reject_account_balance_request addr request_id account =
+  let rej = DTC.default_account_balance_reject () in
+  rej.request_id <- request_id ;
+  rej.reject_text <- Some ("Unknown account " ^ account) ;
+  Log.debug log_dtc "-> [%s] AccountBalanceReject: unknown account %s" addr account
+
 let account_balance_request addr w msg =
   let req = DTC.parse_account_balance_request msg in
   let c = Connection.find_exn addr in
-  let reject account =
-    let rej = DTC.default_account_balance_reject () in
-    rej.request_id <- req.request_id ;
-    rej.reject_text <- Some ("Unknown account " ^ account) ;
-    Log.debug log_dtc "-> [%s] AccountBalanceReject: unknown account %s" c.addr account
-  in
-  begin match req.trade_account with
-    | None ->
-      Log.debug log_dtc "<- [%s] AccountBalanceRequest (all accounts)" c.addr ;
-      Connection.write_exchange_balance ?request_id:req.request_id ~msg_number:1 ~nb_msgs:2 c;
-      Connection.write_margin_balance ?request_id:req.request_id ~msg_number:2 ~nb_msgs:2 c
-    | Some account when account = exchange_account ->
-      Log.debug log_dtc "<- [%s] AccountBalanceRequest (%s)" c.addr account;
-      Connection.write_exchange_balance ?request_id:req.request_id c
-    | Some account when account = margin_account ->
-      Log.debug log_dtc "<- [%s] AccountBalanceRequest (%s)" c.addr account;
-      Connection.write_margin_balance ?request_id:req.request_id c
-    | Some account -> reject account
-  end
+  match req.trade_account with
+  | None
+  | Some "" ->
+    Log.debug log_dtc "<- [%s] AccountBalanceRequest (all accounts)" c.addr ;
+    Connection.write_exchange_balance ?request_id:req.request_id ~msg_number:1 ~nb_msgs:2 c;
+    Connection.write_margin_balance ?request_id:req.request_id ~msg_number:2 ~nb_msgs:2 c
+  | Some account when account = exchange_account ->
+    Log.debug log_dtc "<- [%s] AccountBalanceRequest (%s)" c.addr account;
+    Connection.write_exchange_balance ?request_id:req.request_id c
+  | Some account when account = margin_account ->
+    Log.debug log_dtc "<- [%s] AccountBalanceRequest (%s)" c.addr account;
+    Connection.write_margin_balance ?request_id:req.request_id c
+  | Some account ->
+    reject_account_balance_request addr req.request_id account
 
 let reject_order
     ~c:{ Connection.w }
@@ -1100,7 +1098,7 @@ let send_order_update
 
 (* req argument is normalized. *)
 let submit_order ~c ~(req : DTC.submit_new_single_order) =
-  let { Connection.w ; key ; secret } = c in
+  let { Connection.addr ; w ; key ; secret } = c in
   let symbol = Option.value_exn req.symbol in
   let side = Option.value_exn ~message:"submit_order: side" req.buy_sell in
   let price = Option.value_exn req.price1 in
@@ -1115,6 +1113,7 @@ let submit_order ~c ~(req : DTC.submit_new_single_order) =
     if margin then Rest.submit_margin_order ?max_lending_rate:None
     else Rest.submit_order
   in
+  Log.debug log_dtc "-> [%s] Submit Order %s %f %f" addr symbol price qty ;
   order_f ~buf:buf_json ?tif ~key ~secret ~side ~symbol ~price ~qty () >>| function
   | Error Rest.Http_error.Poloniex msg ->
     reject_order ~c ~req "%s" msg
@@ -1123,6 +1122,7 @@ let submit_order ~c ~(req : DTC.submit_new_single_order) =
       reject_order ~c ~req "%s: %s" id (Rest.Http_error.to_string err)
     end
   | Ok { id; trades; amount_unfilled } -> begin
+      Log.debug log_dtc "<- [%s] Submit Order OK %d" addr id ;
       match trades, amount_unfilled with
       | [], _ ->
         send_order_update ~c ~req
@@ -1140,6 +1140,7 @@ let submit_order ~c ~(req : DTC.submit_new_single_order) =
           ~remaining_qty:0. ;
         if margin then don't_wait_for @@ Connection.update_positions c
       | trades, unfilled ->
+        let trades = Rest.OrderResponse.trades_of_symbol trades symbol in
         let filled_qty =
           List.fold_left trades ~init:0. ~f:(fun a { qty } -> a +. qty) in
         let remaining_qty = qty -. filled_qty in
@@ -1207,10 +1208,7 @@ let submit_new_single_order addr w msg =
   | Exit -> ()
   | exn -> Log.error log_dtc "%s" @@ Exn.to_string exn
 
-let reject_cancel_order
-    ~c:{ Connection.w }
-    ~(req : DTC.cancel_order)
-    k =
+let reject_cancel_order w (req : DTC.cancel_order) k =
   let update = DTC.default_order_update () in
   update.message_number <- Some 1l ;
   update.total_num_messages <- Some 1l ;
@@ -1223,28 +1221,38 @@ let reject_cancel_order
     write_message w `order_update DTC.gen_order_update update
   end k
 
+let send_cancel_update w (req : DTC.Cancel_order.t) =
+  let update = DTC.default_order_update () in
+  update.message_number <- Some 1l ;
+  update.total_num_messages <- Some 1l ;
+  update.order_status <- Some `order_status_canceled ;
+  update.order_update_reason <- Some `order_canceled ;
+  update.client_order_id <- req.client_order_id ;
+  update.server_order_id <- req.server_order_id ;
+  update.exchange_order_id <- req.server_order_id ;
+  write_message w `order_update DTC.gen_order_update update
+
 let cancel_order addr w msg =
-  let ({ Connection.key; secret } as c) = Connection.find_exn addr in
+  let ({ Connection.w ; key ; secret } as c) = Connection.find_exn addr in
     let req = DTC.parse_cancel_order msg in
     match Option.map req.server_order_id ~f:Int.of_string with
     | None ->
-      reject_cancel_order ~c ~req "Server order id not set"
+      reject_cancel_order w req "Server order id not set"
     | Some order_id ->
       Log.debug log_dtc "<- [%s] Order Cancel %d" addr order_id;
-      don't_wait_for begin
+      RestSync.Default.push_nowait begin fun () ->
         Rest.cancel_order ~key ~secret ~order_id () >>| function
         | Error Rest.Http_error.Poloniex msg ->
-          reject_cancel_order ~c ~req "%s" msg
+          reject_cancel_order w req "%s" msg
         | Error _ ->
-          reject_cancel_order ~c ~req
+          reject_cancel_order w req
             "exception raised while trying to cancel %d" order_id
-        | Ok () -> ()
+        | Ok () ->
+          Log.debug log_dtc "-> [%s] Order Cancel OK %d" addr order_id ;
+          send_cancel_update w req
       end
 
-let reject_cancel_replace_order
-    ~c:{ Connection.w ; addr }
-    ~(req : DTC.cancel_replace_order)
-    k =
+let reject_cancel_replace_order addr w (req : DTC.cancel_replace_order) k =
   let price1 =
     if Option.value ~default:false req.price1_is_set then req.price1 else None in
   let price2 =
@@ -1268,33 +1276,64 @@ let reject_cancel_replace_order
     write_message w `order_update DTC.gen_order_update update
   end k
 
+let send_cancel_replace_update w (req : DTC.Cancel_replace_order.t)
+    ?filled_qty
+    ?remaining_qty () =
+  let update = DTC.default_order_update () in
+  let price1_is_set = Option.value ~default:false req.price1_is_set in
+  let price2_is_set = Option.value ~default:false req.price2_is_set in
+  let price1 = match price1_is_set, req.price1 with
+    | true, Some price1 -> Some price1
+    | _ -> None in
+  let price2 = match price2_is_set, req.price2 with
+    | true, Some price2 -> Some price2
+    | _ -> None in
+  update.message_number <- Some 1l ;
+  update.total_num_messages <- Some 1l ;
+  update.order_status <- Some `order_status_open ;
+  update.order_update_reason <- Some `order_cancel_replace_complete ;
+  update.client_order_id <- req.client_order_id ;
+  update.server_order_id <- req.server_order_id ;
+  update.exchange_order_id <- req.server_order_id ;
+  update.price1 <- price1 ;
+  update.price2 <- price2 ;
+  update.order_quantity <- req.quantity ;
+  update.filled_quantity <- filled_qty ;
+  update.remaining_quantity <- remaining_qty ;
+  update.order_type <- req.order_type ;
+  update.time_in_force <- req.time_in_force ;
+  write_message w `order_update DTC.gen_order_update update
+
 let cancel_replace_order addr w msg =
-  let c = Connection.find_exn addr in
+  let { Connection.addr ; w ; key ; secret } = Connection.find_exn addr in
   let req = DTC.parse_cancel_replace_order msg in
-  Log.debug log_dtc "<- [%s] Cancel Replace Order" c.addr ;
-  if Option.is_some req.order_type then
-    reject_cancel_replace_order ~c ~req
+  Log.debug log_dtc "<- [%s] Cancel Replace Order" addr ;
+  let order_type = Option.value ~default:`order_type_unset req.order_type in
+  let tif = Option.value ~default:`tif_unset req.time_in_force in
+  if order_type <> `order_type_unset then
+    reject_cancel_replace_order addr w req
       "Modification of order type is not supported by Poloniex"
-  else if Option.is_some req.time_in_force then
-    reject_cancel_replace_order ~c ~req
+  else if tif <> `tif_unset then
+    reject_cancel_replace_order addr w req
       "Modification of time in force is not supported by Poloniex"
   else
     match Option.map req.server_order_id ~f:Int.of_string, req.price1 with
     | None, _ ->
-      reject_cancel_replace_order ~c ~req "Server order id is not set"
+      reject_cancel_replace_order addr w req "Server order id is not set"
     | _, None ->
-      reject_cancel_replace_order ~c ~req
+      reject_cancel_replace_order addr w req
         "Order modify without setting a price is not supported by Poloniex"
-    | Some order_id, Some price ->
+    | Some id, Some price ->
       let qty = Option.map req.quantity ~f:(( *. ) 1e-4) in
       RestSync.Default.push_nowait begin fun () ->
-        Rest.modify_order ~key:c.key ~secret:c.secret ?qty ~price ~order_id () >>| function
+        Rest.modify_order ~key ~secret ?qty ~price ~order_id:id () >>| function
         | Error Rest.Http_error.Poloniex msg ->
-          reject_cancel_replace_order ~c ~req "cancel order %d failed: %s" order_id msg
+          reject_cancel_replace_order addr w req "cancel order %d failed: %s" id msg
         | Error _ ->
-          reject_cancel_replace_order ~c ~req "cancel order %d failed" order_id
-        | Ok _ ->
-          () (* TODO: send order update *)
+          reject_cancel_replace_order addr w req "cancel order %d failed" id
+        | Ok { id; trades; amount_unfilled } ->
+          Log.debug log_dtc "<- [%s] Cancel Replace Order %d OK" addr id ;
+          send_cancel_replace_update w req ()
       end
 
 let dtcserver ~server ~port =
@@ -1408,7 +1447,7 @@ let command =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "-update-client−span" (optional_with_default "10s" string) ~doc:"span Span between client updates (default: 10s)"
+    +> flag "-update-client−span" (optional_with_default "30s" string) ~doc:"span Span between client updates (default: 10s)"
     +> flag "-heartbeat" (optional string) ~doc:" WS heartbeat period (default: 25s)"
     +> flag "-timeout" (optional_with_default "60s" string) ~doc:" max Disconnect if no message received in N seconds (default: 60s)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
