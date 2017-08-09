@@ -72,22 +72,29 @@ module Instrument = struct
 
   let create ~db ~ctrl = { db ; ctrl }
 
-  let datadir = ref (Filename.concat "data" "poloniex")
+  let ( // ) = Filename.concat
+
+  let datadir = ref ("data" // "poloniex")
   let set_datadir d = datadir := d
 
   let db_path symbol =
-    Filename.concat !datadir symbol
+    !datadir // "db" // symbol
 
-  let load symbols_in_use =
+  let ctrl_path symbol =
+    !datadir // "ctrl" // symbol
+
+  let load symbols =
     Deferred.Result.bind
       (REST.symbols ~log:(Lazy.force log) ())
       ~f:begin fun all_symbols ->
         let symbols_in_use =
-          String.Set.(inter (of_list all_symbols) (of_list symbols_in_use) |> to_list) in
+          if String.Set.is_empty symbols then all_symbols
+          else
+            String.Set.(inter (of_list all_symbols) symbols |> to_list) in
         Deferred.List.map
           ~how:`Sequential symbols_in_use ~f:begin fun symbol ->
           let db = DB.open_db (db_path symbol) in
-          CtrlFile.open_file symbol >>| fun ctrl ->
+          CtrlFile.open_file (ctrl_path symbol) >>| fun ctrl ->
           info "Loaded instrument %s" symbol ;
           symbol, create ~db ~ctrl
         end >>| fun res -> Ok res
