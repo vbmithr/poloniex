@@ -18,50 +18,58 @@ end
 
 module CtrlFile = struct
   type t = {
-    fd : Fd.t ;
-    ba : (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+    fn : string ;
+    bitv : Bitv.t
   }
 
-  let create ~fd ~ba = { fd ; ba }
-
-  let with_file fn ~f =
-    Unix.with_file fn ~mode:[`Rdwr] ~f:begin fun fd ->
-      let unix_fd = Fd.file_descr_exn fd in
-      let bs = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 8192) in
-      f bs
-    end
-
   let open_file fn =
-    Unix.openfile fn ~mode:[`Creat ; `Rdwr] >>| fun fd ->
-    let unix_fd = Fd.file_descr_exn fd in
-    let ba = Bigarray.(Array1.map_file unix_fd int8_unsigned c_layout true 8192) in
-    create ~fd ~ba
+    try
+      let ic = Caml.open_in_bin fn in
+      try
+        let bitv = Bitv.input_bin ic in
+        Caml.close_in ic ;
+        { fn ; bitv }
+      with exn ->
+        Caml.close_in ic ;
+        raise exn
+    with exn ->
+      error "CtrlFile.open_file: %s" (Exn.to_string exn) ;
+      { fn ; bitv = Bitv.create (365 * 24 * 10) false }
 
-  let close { fd } = Fd.close fd
+  let close { fn ; bitv } =
+    let oc = Caml.open_out_bin fn in
+    try
+      Bitv.output_bin oc bitv ;
+      Caml.close_out oc
+    with exn ->
+      Caml.close_out oc ;
+      raise exn
 
-  let beginning =
-    let open Time_ns in
-    of_date_ofday
-      ~zone:Time.Zone.utc (Date.create_exn ~y:2017 ~m:Month.Jan ~d:1)
-      Ofday.start_of_day
+  let genesis_date =
+    Date.create_exn ~y:2017 ~m:Month.Jan ~d:1
 
-  let jobs { ba } f =
+  let genesis_ts =
+    Time_ns.(of_date_ofday ~zone:Time.Zone.utc genesis_date Ofday.start_of_day)
+
+  let jobs ?(start=genesis_date) { bitv } f =
+    let idx = 24 * Date.diff start genesis_date in
     let now_ts = Time_ns.now () in
-    let rec inner (i, start_ts, thunks) =
-      let end_ts = Time_ns.(add start_ts (Span.of_hr 1.)) in
+    let rec inner (i, thunks) =
+      let start_ts = Time_ns.(add genesis_ts (Span.of_int_sec (i * 3600))) in
+      let end_ts = Time_ns.(add start_ts (Span.of_int_sec 3600)) in
       let latest = Time_ns.(end_ts >= now_ts) in
       let thunks =
         begin
-          if Bigarray.Array1.get ba i = 0 || latest then
+          if not (Bitv.get bitv i) || latest then
             begin fun () -> f ~start_ts ~end_ts >>| function
               | Error _ -> ()
-              | Ok _ -> Bigarray.Array1.set ba i 1
+              | Ok _ -> Bitv.set bitv i true
             end :: thunks
           else thunks
         end in
       if latest then thunks
-      else inner (succ i, end_ts, thunks)
-    in inner (0, beginning, [])
+      else inner (succ i, thunks)
+    in inner (idx, [])
 end
 
 module Instrument = struct
@@ -85,20 +93,18 @@ module Instrument = struct
 
   let load symbols =
     Deferred.Result.bind
-      (REST.symbols ~log:(Lazy.force log) ())
-      ~f:begin fun all_symbols ->
-        let symbols_in_use =
-          if String.Set.is_empty symbols then all_symbols
-          else
-            String.Set.(inter (of_list all_symbols) symbols |> to_list) in
-        Deferred.List.map
-          ~how:`Sequential symbols_in_use ~f:begin fun symbol ->
-          let db = DB.open_db (db_path symbol) in
-          CtrlFile.open_file (ctrl_path symbol) >>| fun ctrl ->
-          info "Loaded instrument %s" symbol ;
-          symbol, create ~db ~ctrl
-        end >>| fun res -> Ok res
-      end
+      (REST.symbols ~log:(Lazy.force log) ()) ~f:begin fun all_symbols ->
+      let symbols_in_use =
+        if String.Set.is_empty symbols then all_symbols
+        else String.Set.(inter (of_list all_symbols) symbols |> to_list) in
+      List.map symbols_in_use ~f:begin fun symbol ->
+        let db = DB.open_db (db_path symbol) in
+        let ctrl = CtrlFile.open_file (ctrl_path symbol) in
+        info "Loaded instrument %s" symbol ;
+        symbol, create ~db ~ctrl
+      end |> fun res ->
+      return (Ok res)
+    end
 
   let active : t String.Table.t = String.Table.create ()
   let find = String.Table.find active
@@ -112,18 +118,21 @@ module Instrument = struct
       end
     end
 
-  let thunks_exn symbol f =
+  let thunks_exn ?start symbol f =
     let { ctrl } = find_exn symbol in
-    CtrlFile.jobs ctrl f
+    CtrlFile.jobs ?start ctrl f
 
   let close { db ; ctrl } =
     DB.close db ;
     CtrlFile.close ctrl
 
   let shutdown () =
-    String.Table.to_alist active |>
-    Deferred.List.iter ~how:`Parallel ~f:(fun (_, i) -> close i) >>| fun () ->
-    info "Saved %d dbs" @@ String.Table.length active ;
+    let nb_closed =
+      String.Table.fold active ~init:0 ~f:begin fun ~key:_ ~data a ->
+        close data ;
+        succ a
+      end in
+    info "Saved %d dbs" nb_closed
 end
 
 let dry_run = ref false
@@ -467,7 +476,7 @@ let run ?start port no_pump symbols =
       if no_pump then Deferred.unit
       else
         let thunks = List.fold_left symbols ~init:[] ~f:begin fun a symbol ->
-          List.rev_append (Instrument.thunks_exn symbol (pump symbol)) a
+          List.rev_append (Instrument.thunks_exn ?start symbol (pump symbol)) a
         end in
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
@@ -480,7 +489,7 @@ let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel sym
   Signal.handle Signal.terminating ~f:begin fun _ ->
     info "Data server stopping";
     don't_wait_for begin
-      Instrument.shutdown () >>= fun () ->
+      Instrument.shutdown () ;
       Shutdown.exit 0
     end
   end ;
@@ -497,7 +506,7 @@ let command =
     empty
     +> flag "-dry-run" no_arg ~doc:" Do not write trades in DBs"
     +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
-    +> flag "-start" (optional float) ~doc:"float Start gathering history N days in the past (default: use start file)"
+    +> flag "-start" (optional date) ~doc:"float Start gathering history N days in the past (default: use start file)"
     +> flag "-port" (optional_with_default 5574 int) ~doc:"int TCP port to use (5574)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-datadir" (optional_with_default (Filename.concat "data" "poloniex") string) ~doc:"path Where to store DBs (data)"

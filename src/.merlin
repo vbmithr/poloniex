@@ -26,6 +26,7 @@ PKG bigarray
 PKG bin_prot
 PKG bin_prot.shape
 PKG biniou
+PKG bitv
 PKG bytes
 PKG cohttp
 PKG cohttp-async
