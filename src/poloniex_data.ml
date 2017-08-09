@@ -104,10 +104,11 @@ module Instrument = struct
   let find = String.Table.find active
   let find_exn = String.Table.find_exn active
 
-  let load symbols_in_use =
-    Deferred.Result.map (load symbols_in_use) ~f:begin fun instruments ->
-      List.iter instruments ~f:begin fun (symbol, i) ->
-        String.Table.add_exn active symbol i
+  let load symbols =
+    Deferred.Result.map (load symbols) ~f:begin fun instruments ->
+      List.fold_left instruments ~init:[] ~f:begin fun a (symbol, i) ->
+        String.Table.add_exn active symbol i ;
+        symbol :: a
       end
     end
 
@@ -453,19 +454,19 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.on_port port) server_fun
 
-let run ?start port no_pump symbols_in_use =
-  Instrument.load symbols_in_use >>= function
+let run ?start port no_pump symbols =
+  Instrument.load symbols >>= function
   | Error err ->
     error "%s" (REST.Http_error.to_string err) ;
     Deferred.unit
-  | Ok () ->
+  | Ok symbols ->
     info "Data server starting";
     dtcserver ~server:`TCP ~port >>= fun server ->
     Deferred.all_unit [
       Tcp.Server.close_finished server ;
       if no_pump then Deferred.unit
       else
-        let thunks = List.fold symbols_in_use ~init:[] ~f:begin fun a symbol ->
+        let thunks = List.fold_left symbols ~init:[] ~f:begin fun a symbol ->
           List.rev_append (Instrument.thunks_exn symbol (pump symbol)) a
         end in
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
@@ -487,7 +488,7 @@ let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel sym
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     set_output Log.Output.[stderr (); writer `Text log_writer];
-    run ?start port no_pump symbols
+    run ?start port no_pump (String.Set.of_list symbols)
   end
 
 let command =
