@@ -59,14 +59,20 @@ module CtrlFile = struct
       let end_ts = Time_ns.(add start_ts (Span.of_int_sec 3600)) in
       let latest = Time_ns.(end_ts >= now_ts) in
       let thunks =
-        begin
-          if not (Bitv.get bitv i) || latest then
-            begin fun () -> f ~start_ts ~end_ts >>| function
-              | Error _ -> ()
-              | Ok _ -> Bitv.set bitv i true
-            end :: thunks
-          else thunks
-        end in
+        if i >= 0 then begin
+            if not (Bitv.get bitv i) || latest then
+              begin fun () -> f ~start_ts ~end_ts >>| function
+                | Error err -> error "%s" (REST.Http_error.to_string err)
+                | Ok _ -> Bitv.set bitv i true
+              end :: thunks
+            else thunks
+          end
+        else begin fun () ->
+          f ~start_ts ~end_ts >>| Result.iter_error ~f:begin fun err ->
+            error "%s" (REST.Http_error.to_string err)
+          end
+        end :: thunks
+      in
       if latest then thunks
       else inner (succ i, thunks)
     in inner (idx, [])
