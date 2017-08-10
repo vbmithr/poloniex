@@ -319,8 +319,8 @@ let stream_tick_responses symbol
       let p = Int63.to_float t.Tick.p /. 1e8 in
       let v = Int63.to_float t.v /. 1e8 in
       let side = match t.side with
-        | `buy -> `at_bid
-        | `sell -> `at_ask
+        | `buy -> `at_ask
+        | `sell -> `at_bid
         | `buy_sell_unset -> `bid_ask_unset in
       resp.date_time <- Some (float_of_ts t.ts) ;
       resp.price <- Some p ;
