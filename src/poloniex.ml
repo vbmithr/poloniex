@@ -480,15 +480,15 @@ let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
 let int32_of_time ts = Int32.of_int64_exn (int64_of_time ts)
 
-let at_bid_or_ask_to_dtc : Side.t -> DTC.at_bid_or_ask_enum = function
+let at_bid_or_ask_of_depth : Side.t -> DTC.at_bid_or_ask_enum = function
   | `buy -> `at_bid
   | `sell -> `at_ask
   | `buy_sell_unset -> `bid_ask_unset
 
-let at_bid_or_ask_of_dtc : DTC.at_bid_or_ask_enum -> Side.t = function
-  | `at_bid -> `buy
-  | `at_ask -> `sell
-  | `bid_ask_unset -> `buy_sell_unset
+let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
+  | `buy -> `at_ask
+  | `sell -> `at_bid
+  | `buy_sell_unset -> `bid_ask_unset
 
 let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
   Log.debug log_plnx "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
@@ -497,7 +497,7 @@ let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
     let on_symbol_id symbol_id =
       let update = DTC.default_market_data_update_trade () in
       update.symbol_id <- Some symbol_id ;
-      update.at_bid_or_ask <- Some (at_bid_or_ask_to_dtc side) ;
+      update.at_bid_or_ask <- Some (at_bid_or_ask_of_trade side) ;
       update.price <- Some price ;
       update.volume <- Some qty ;
       update.date_time <- Some (float_of_time ts) ;
@@ -538,7 +538,7 @@ let on_book_updates pair ts updates =
       if u.qty = 0.
       then `market_depth_delete_level
       else `market_depth_insert_update_level in
-    update.side <- Some (at_bid_or_ask_to_dtc u.side) ;
+    update.side <- Some (at_bid_or_ask_of_depth u.side) ;
     update.update_type <- Some update_type ;
     update.price <- Some u.price ;
     update.quantity <- Some u.qty ;
