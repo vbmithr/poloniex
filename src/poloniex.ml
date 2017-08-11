@@ -958,56 +958,76 @@ let current_positions_request addr w msg =
   end ;
   Log.debug log_dtc "-> [%s] %d position(s)" addr nb_msgs
 
+let send_no_order_fills
+  w
+  (req : DTC.Historical_order_fills_request.t)
+  (resp : DTC.Historical_order_fill_response.t) =
+  resp.request_id <- req.request_id ;
+  resp.no_order_fills <- Some true ;
+  resp.total_number_messages <- Some 1l ;
+  resp.message_number <- Some 1l ;
+  write_message w `historical_order_fill_response
+    DTC.gen_historical_order_fill_response resp
+
+let send_order_fill ?(nb_msgs=1) ~symbol
+    w
+    (req : DTC.Historical_order_fills_request.t)
+    (resp : DTC.Historical_order_fill_response.t)
+    msg_number
+    { Rest.TradeHistory.gid; id; ts; price; qty; fee; order_id; side; category } =
+  let trade_account = if margin_enabled symbol then margin_account else exchange_account in
+  resp.request_id <- req.request_id ;
+  resp.trade_account <- Some trade_account ;
+  resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
+  resp.message_number <- Some msg_number ;
+  resp.symbol <- Some symbol ;
+  resp.exchange <- Some my_exchange ;
+  resp.server_order_id <- Some (Int.to_string gid) ;
+  resp.buy_sell <- Some side ;
+  resp.price <- Some price ;
+  resp.quantity <- Some qty ;
+  resp.date_time <- Some (int64_of_time ts) ;
+  write_message w `historical_order_fill_response
+    DTC.gen_historical_order_fill_response resp ;
+  Int32.succ msg_number
+
 let historical_order_fills addr w msg =
   let { Connection.key; secret; trades } = Connection.find_exn addr in
   let req = DTC.parse_historical_order_fills_request msg in
   let resp = DTC.default_historical_order_fill_response () in
-  Log.debug log_dtc "<- [%s] Historical Order Fills Req" addr ;
-  let send_no_order_fills () =
-    resp.request_id <- req.request_id ;
-    resp.no_order_fills <- Some true ;
-    resp.total_number_messages <- Some 1l ;
-    resp.message_number <- Some 1l ;
-    write_message w `historical_order_fill_response
-      DTC.gen_historical_order_fill_response resp
-  in
-  let send_order_fill ?(nb_msgs=1) ~symbol msg_number
-      { Rest.TradeHistory.gid; id; ts; price; qty; fee; order_id; side; category } =
-    let trade_account = if margin_enabled symbol then margin_account else exchange_account in
-    resp.request_id <- req.request_id ;
-    resp.trade_account <- Some trade_account ;
-    resp.total_number_messages <- Some (Int32.of_int_exn nb_msgs) ;
-    resp.message_number <- Some msg_number ;
-    resp.symbol <- Some symbol ;
-    resp.exchange <- Some my_exchange ;
-    resp.server_order_id <- Some (Int.to_string gid) ;
-    resp.buy_sell <- Some side ;
-    resp.price <- Some price ;
-    resp.quantity <- Some qty ;
-    resp.date_time <- Some (int64_of_time ts) ;
-    write_message w `historical_order_fill_response
-      DTC.gen_historical_order_fill_response resp ;
-    Int32.succ msg_number
-  in
-  let nb_trades = String.Table.fold trades ~init:0 ~f:begin fun ~key:_ ~data a ->
-      a + Rest.TradeHistory.Set.length data
+  let min_ts =
+    Option.value_map req.number_of_days ~default:Time_ns.epoch ~f:begin fun n ->
+      Time_ns.(sub (now ()) (Span.of_day (Int32.to_float n)))
     end in
-  if nb_trades = 0 then send_no_order_fills ()
+  Log.debug log_dtc "<- [%s] Historical Order Fills Req" addr ;
+  let nb_trades = String.Table.fold trades ~init:0 ~f:begin fun ~key:_ ~data a ->
+      Rest.TradeHistory.Set.fold data ~init:a ~f:begin fun a t ->
+        if Time_ns.(t.Rest.TradeHistory.ts > min_ts) then succ a else a
+      end
+    end in
+  if nb_trades = 0 then send_no_order_fills w req resp
   else begin
     match req.server_order_id with
     | None -> ignore @@ String.Table.fold trades ~init:1l ~f:begin fun ~key:symbol ~data a ->
-        Rest.TradeHistory.Set.fold data ~init:a ~f:(send_order_fill ~nb_msgs:nb_trades ~symbol);
+        Rest.TradeHistory.Set.fold data ~init:a ~f:begin fun a t ->
+          if Time_ns.(t.ts > min_ts) then
+            send_order_fill ~nb_msgs:nb_trades ~symbol w req resp a t
+          else a
+        end
       end
     | Some srv_ord_id ->
       let srv_ord_id = Int.of_string srv_ord_id in
-      begin match String.Table.fold trades ~init:("", None) ~f:begin fun ~key:symbol ~data a ->
-          match snd a, (Rest.TradeHistory.Set.find data ~f:(fun { gid } -> gid = srv_ord_id)) with
-          | _, Some t -> symbol, Some t
-          | _ -> a
+      begin
+        match String.Table.fold trades ~init:("", None) ~f:begin fun ~key:symbol ~data a ->
+            match snd a, (Rest.TradeHistory.Set.find data ~f:(fun { gid } -> gid = srv_ord_id)) with
+            | _, Some t -> symbol, Some t
+            | _ -> a
         end
         with
-        | _, None -> send_no_order_fills ()
-        | symbol, Some t -> ignore @@ send_order_fill ~symbol 1l t
+        | _, None ->
+          send_no_order_fills w req resp
+        | symbol, Some t ->
+          ignore @@ send_order_fill ~symbol w req resp 1l t
       end
   end
 
