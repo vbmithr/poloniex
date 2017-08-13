@@ -512,7 +512,7 @@ let command =
     empty
     +> flag "-dry-run" no_arg ~doc:" Do not write trades in DBs"
     +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
-    +> flag "-start" (optional date) ~doc:"float Start gathering history N days in the past (default: use start file)"
+    +> flag "-start" (optional date) ~doc:"date Start gathering history at DATE (default: 2017-01-01)"
     +> flag "-port" (optional_with_default 5574 int) ~doc:"int TCP port to use (5574)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-datadir" (optional_with_default (Filename.concat "data" "poloniex") string) ~doc:"path Where to store DBs (data)"
