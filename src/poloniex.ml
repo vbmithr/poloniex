@@ -57,13 +57,13 @@ let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
 
 module Book = struct
   type t = {
-    ts : Time_ns.t ;
-    book : Float.t Float.Map.t ;
+    mutable ts : Time_ns.t ;
+    mutable book : Float.t Float.Map.t
   }
 
   let empty = {
     ts = Time_ns.epoch ;
-    book = Float.Map.empty
+    book = Float.Map.empty ;
   }
 
   let bids : t String.Table.t = String.Table.create ()
@@ -72,11 +72,22 @@ module Book = struct
   let get_bids = String.Table.find_or_add bids ~default:(fun () -> empty)
   let get_asks = String.Table.find_or_add asks ~default:(fun () -> empty)
 
-  let set_bids ~symbol ~ts ~book = String.Table.set bids ~key:symbol ~data:{ ts ; book }
-  let set_asks ~symbol ~ts ~book = String.Table.set asks ~key:symbol ~data:{ ts ; book }
+  let set_bids ~symbol ~ts ~book =
+    String.Table.set bids ~key:symbol ~data:{ ts ; book }
+  let set_asks ~symbol ~ts ~book =
+    String.Table.set asks ~key:symbol ~data:{ ts ; book }
 end
 
 let latest_trades : Trade.t String.Table.t = String.Table.create ()
+let session_high : Float.t String.Table.t = String.Table.create ()
+let session_low : Float.t String.Table.t = String.Table.create ()
+let session_volume : Float.t String.Table.t = String.Table.create ()
+
+let _ = Clock_ns.every Time_ns.Span.day begin fun () ->
+    String.Table.clear session_high ;
+    String.Table.clear session_low ;
+    String.Table.clear session_volume
+  end
 
 let buf_json = Bi_outbuf.create 4096
 
@@ -97,7 +108,7 @@ let descr_of_symbol s =
     Buffer.contents buf
   | _ -> invalid_argf "descr_of_symbol: %s" s ()
 
-let secdef_of_ticker ?request_id ?(final=true) t =
+let secdef_of_symbol ?request_id ?(final=true) symbol =
   let request_id = match request_id with
     | Some reqid -> reqid
     | None when !sc_mode -> 110_000_000l
@@ -105,10 +116,10 @@ let secdef_of_ticker ?request_id ?(final=true) t =
   let secdef = DTC.default_security_definition_response () in
   secdef.request_id <- Some request_id ;
   secdef.is_final_message <- Some final ;
-  secdef.symbol <- Some t.Ticker.symbol ;
+  secdef.symbol <- Some symbol ;
   secdef.exchange <- Some my_exchange ;
   secdef.security_type <- Some `security_type_forex ;
-  secdef.description <- Some (descr_of_symbol t.symbol) ;
+  secdef.description <- Some (descr_of_symbol symbol) ;
   secdef.min_price_increment <- Some 1e-8 ;
   secdef.currency_value_per_increment <- Some 1e-8 ;
   secdef.price_display_format <- Some `price_display_format_decimal_8 ;
@@ -399,83 +410,6 @@ module Connection = struct
     end
 end
 
-let send_update_msgs depth symbol_id w ts (t:Ticker.t) (t':Ticker.t) =
-  if t.base_volume <> t'.base_volume then begin
-    let update = DTC.default_market_data_update_session_volume () in
-    update.symbol_id <- Some symbol_id ;
-    update.volume <- Some (t'.base_volume) ;
-    write_message w `market_data_update_session_volume
-      DTC.gen_market_data_update_session_volume update
-  end;
-  if t.low24h <> t'.low24h then begin
-    let update = DTC.default_market_data_update_session_low () in
-    update.symbol_id <- Some symbol_id ;
-    update.price <- Some (t'.low24h) ;
-    write_message w `market_data_update_session_low
-      DTC.gen_market_data_update_session_low update
-  end;
-  if t.high24h <> t'.high24h then begin
-    let update = DTC.default_market_data_update_session_high () in
-    update.symbol_id <- Some symbol_id ;
-    update.price <- Some (t'.high24h) ;
-    write_message w `market_data_update_session_high
-      DTC.gen_market_data_update_session_high update
-  end;
-  (* if t.last <> t'.last then begin *)
-  (*   let float_of_ts ts = Time_ns.to_int_ns_since_epoch ts |> Float.of_int |> fun date -> date /. 1e9 in *)
-  (*   let update = DTC.default_market_data_update_last_trade_snapshot () in *)
-  (*   update.symbol_id <- Some symbol_id ; *)
-  (*   update.last_trade_date_time <- Some (float_of_ts ts) ; *)
-  (*   update.last_trade_price <- Some (t'.last) ; *)
-  (*   write_message w `market_data_update_last_trade_snapshot *)
-  (*     DTC.gen_market_data_update_last_trade_snapshot update *)
-  (* end; *)
-  if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
-    let update = DTC.default_market_data_update_bid_ask () in
-    update.symbol_id <- Some symbol_id ;
-    update.bid_price <- Some (t'.bid) ;
-    update.ask_price <- Some (t'.ask) ;
-    write_message w `market_data_update_bid_ask
-      DTC.gen_market_data_update_bid_ask update
-  end
-
-let on_ticker_update ts t t' =
-  let send_secdef_msg w t =
-    let secdef = secdef_of_ticker ~final:true t in
-    write_message w `security_definition_response
-      DTC.gen_security_definition_response secdef in
-  let on_connection { Connection.addr; w; subs; subs_depth; send_secdefs } =
-    let on_symbol_id ?(depth=false) symbol_id =
-      send_update_msgs depth symbol_id w ts t t';
-      Log.debug log_dtc "-> [%s] %s TICKER" addr t.symbol
-    in
-    if send_secdefs && phys_equal t t' then send_secdef_msg w t ;
-    match String.Table.(find subs t.symbol, find subs_depth t.symbol) with
-    | Some sym_id, None -> on_symbol_id ~depth:false sym_id
-    | Some sym_id, _ -> on_symbol_id ~depth:true sym_id
-    | _ -> ()
-  in
-  Connection.iter ~f:on_connection
-
-let update_tickers () =
-  let now = Time_ns.now () in
-  Rest.tickers () >>| function
-  | Error err ->
-    Log.error log_plnx "get tickers: %s" (Rest.Http_error.to_string err)
-  | Ok ts ->
-    List.iter ts ~f:begin fun t ->
-      let old_ts, old_t =
-        String.Table.find_or_add tickers t.symbol ~default:(fun () -> (now, t)) in
-      String.Table.set tickers t.symbol (now, t) ;
-      on_ticker_update now old_t t ;
-    end
-
-let rec loop_update_tickers () =
-  Clock_ns.every
-    ~continue_on_error:true
-    (Time_ns.Span.of_int_sec 60)
-    (fun () -> RestSync.Default.push_nowait update_tickers)
-
 let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
 let int32_of_time ts = Int32.of_int64_exn (int64_of_time ts)
@@ -490,88 +424,152 @@ let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
   | `sell -> `at_bid
   | `buy_sell_unset -> `bid_ask_unset
 
+let depth_update = DTC.default_market_depth_update_level ()
+let bidask_update = DTC.default_market_data_update_bid_ask ()
+let trade_update = DTC.default_market_data_update_trade ()
+let session_low_update = DTC.default_market_data_update_session_low ()
+let session_high_update = DTC.default_market_data_update_session_high ()
+
 let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
+  String.Table.set latest_trades pair t ;
+  let session_high =
+    let h =
+      Option.value ~default:Float.min_value (String.Table.find session_high pair) in
+    if h < t.price then begin
+      String.Table.set session_high pair t.price ;
+      Some t.price
+    end else None in
+  let session_low =
+    let l = Option.value ~default:Float.max_value (String.Table.find session_low pair) in
+    if l > t.price then begin
+      String.Table.set session_low pair t.price ;
+      Some t.price
+    end else None in
+  String.Table.set session_volume pair begin
+    match (String.Table.find session_volume pair) with
+    | None -> t.qty
+    | Some qty -> qty +. t.qty
+  end ;
   Log.debug log_plnx "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
   (* Send trade updates to subscribers. *)
   let on_connection { Connection.addr; w; subs; _} =
     let on_symbol_id symbol_id =
-      let update = DTC.default_market_data_update_trade () in
-      update.symbol_id <- Some symbol_id ;
-      update.at_bid_or_ask <- Some (at_bid_or_ask_of_trade side) ;
-      update.price <- Some price ;
-      update.volume <- Some qty ;
-      update.date_time <- Some (float_of_time ts) ;
+      trade_update.symbol_id <- Some symbol_id ;
+      trade_update.at_bid_or_ask <- Some (at_bid_or_ask_of_trade side) ;
+      trade_update.price <- Some price ;
+      trade_update.volume <- Some qty ;
+      trade_update.date_time <- Some (float_of_time ts) ;
       write_message w `market_data_update_trade
-        DTC.gen_market_data_update_trade update ;
-      (* Log.debug log_dtc "-> [%s] %s T %s" *)
-      (*   addr pair (Sexplib.Sexp.to_string (Trade.sexp_of_t t)); *)
+        DTC.gen_market_data_update_trade trade_update ;
+      Option.iter session_low ~f:begin fun p ->
+        session_low_update.symbol_id <- Some symbol_id ;
+        session_low_update.price <- Some p ;
+        write_message w `market_data_update_session_low
+          DTC.gen_market_data_update_session_low session_low_update
+      end ;
+      Option.iter session_high ~f:begin fun p ->
+        session_high_update.symbol_id <- Some symbol_id ;
+        session_high_update.price <- Some p ;
+        write_message w `market_data_update_session_high
+          DTC.gen_market_data_update_session_high session_high_update
+      end
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
   String.Table.iter Connection.active ~f:on_connection
 
-let on_book_updates pair ts updates =
-  let bids  = Book.get_bids pair in
-  let asks = Book.get_asks pair in
-  let fold_updates (bid, ask) { Plnx.Book.side; price; qty } =
-    match side with
+let send_depth_update
+    (update : DTC.Market_depth_update_level.t)
+    w (u : Plnx.BookEntry.t) =
+  let update_type =
+    if u.qty = 0.
+    then `market_depth_delete_level
+    else `market_depth_insert_update_level in
+  update.side <- Some (at_bid_or_ask_of_depth u.side) ;
+  update.update_type <- Some update_type ;
+  update.price <- Some u.price ;
+  update.quantity <- Some u.qty ;
+  write_message w `market_depth_update_level
+    DTC.gen_market_depth_update_level update
+
+let send_bidask_update
+    (update : DTC.Market_data_update_bid_ask.t) w bid ask =
+  update.bid_price <- Some bid ;
+  update.ask_price <- Some ask ;
+  write_message w `market_data_update_bid_ask
+    DTC.gen_market_data_update_bid_ask update
+
+let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
+  let old_bids = (Book.get_bids pair).book in
+  let old_asks = (Book.get_asks pair).book in
+  let old_best_bid = Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt old_bids) in
+  let old_best_ask = Option.value_map ~f:fst ~default:Float.max_value (Float.Map.min_elt old_asks) in
+  let book, new_book = match side with
     | `buy_sell_unset -> invalid_arg "on_book_updates: side unset"
     | `buy ->
-      (if qty > 0. then Float.Map.add bid ~key:price ~data:qty
-       else Float.Map.remove bid price),
-      ask
+      let { Book.book } = Book.get_bids pair in
+      let new_book =
+        (if qty > 0. then Float.Map.add book ~key:price ~data:qty
+         else Float.Map.remove book price) in
+      Book.set_bids ~symbol:pair ~ts ~book:new_book ;
+      book, new_book
     | `sell ->
-      (if qty > 0. then Float.Map.add ask ~key:price ~data:qty
-       else Float.Map.remove ask price),
-      bid
+      let { Book.book } = Book.get_asks pair in
+      let new_book =
+        (if qty > 0. then Float.Map.add book ~key:price ~data:qty
+         else Float.Map.remove book price) in
+      Book.set_asks ~symbol:pair ~ts ~book:new_book ;
+      book, new_book
   in
-  let bids, asks =
-    List.fold_left ~init:(bids.book, asks.book) updates ~f:fold_updates in
-  Book.set_bids ~symbol:pair ~ts ~book:bids ;
-  Book.set_asks ~symbol:pair ~ts ~book:asks ;
-  let send_depth_updates
-      (update : DTC.Market_depth_update_level.t)
-      addr_str w symbol_id u =
-    Log.debug log_dtc "-> [%s] %s D %s"
-      addr_str pair (Sexplib.Sexp.to_string (Plnx.Book.sexp_of_entry u));
-    let update_type =
-      if u.qty = 0.
-      then `market_depth_delete_level
-      else `market_depth_insert_update_level in
-    update.side <- Some (at_bid_or_ask_of_depth u.side) ;
-    update.update_type <- Some update_type ;
-    update.price <- Some u.price ;
-    update.quantity <- Some u.qty ;
-    write_message w `market_depth_update_level
-      DTC.gen_market_depth_update_level update
+  let new_best_bidask = match side with
+    | `buy_sell_unset -> None
+    | `buy ->
+      let new_best_bid =
+        Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt new_book) in
+      if new_best_bid > old_best_bid then
+        Some (new_best_bid, old_best_ask) else None
+    | `sell ->
+      let new_best_ask =
+        Option.value_map ~f:fst ~default:Float.max_value (Float.Map.min_elt new_book) in
+      if new_best_ask < old_best_ask then
+        Some (old_best_bid, new_best_ask) else None
   in
-  let update = DTC.default_market_depth_update_level () in
-  let on_connection { Connection.addr; w; subs; subs_depth; _ } =
-    let on_symbol_id symbol_id =
-      update.symbol_id <- Some symbol_id ;
-      List.iter updates ~f:(send_depth_updates update addr w symbol_id);
+  let on_connection { Connection.addr; w; subs; subs_depth } =
+    let update_depth symbol_id =
+      depth_update.symbol_id <- Some symbol_id ;
+      Log.debug log_dtc "-> [%s] %s D %s"
+        addr pair (Sexplib.Sexp.to_string (Plnx.BookEntry.sexp_of_t u));
+      send_depth_update depth_update w u
     in
-    Option.iter String.Table.(find subs_depth pair) ~f:on_symbol_id
+    let update_bidask symbol_id (bid, ask) =
+      bidask_update.symbol_id <- Some symbol_id ;
+      Log.debug log_dtc "-> [%s] %s BIDASK %s"
+        addr pair (Sexplib.Sexp.to_string (Plnx.BookEntry.sexp_of_t u));
+      send_bidask_update bidask_update w bid ask
+    in
+    match String.Table.(find subs pair, find subs_depth pair) with
+    | _, Some symbol_id -> update_depth symbol_id
+    | Some symbol_id, _ -> Option.iter new_best_bidask ~f:(update_bidask symbol_id)
+    | _ -> ()
   in
   String.Table.iter Connection.active ~f:on_connection
+
+let on_event subid id now = function
+  | Ws.Repr.Snapshot { symbol ; bid ; ask } ->
+    Int.Table.set subid_to_sym subid symbol ;
+    Book.set_bids ~symbol ~ts:now ~book:bid ;
+    Book.set_asks ~symbol ~ts:now ~book:ask ;
+  | Update entry ->
+    let symbol = Int.Table.find_exn subid_to_sym subid in
+    on_book_update symbol now entry
+  | Trade t ->
+    let symbol = Int.Table.find_exn subid_to_sym subid in
+    on_trade_update symbol t
 
 let ws ?heartbeat timeout =
   let latest_ts = ref Time_ns.epoch in
   let to_ws, to_ws_w = Pipe.create () in
   let initialized = ref false in
-  let on_event subid id now = function
-    | Ws.Repr.Snapshot { symbol ; bid ; ask } ->
-      Int.Table.set subid_to_sym subid symbol ;
-      Book.set_bids ~symbol ~ts:now ~book:bid ;
-      Book.set_asks ~symbol ~ts:now ~book:ask ;
-    | Update entry ->
-      let symbol = Int.Table.find_exn subid_to_sym subid in
-      on_book_updates symbol now [entry]
-    | Trade t ->
-      let symbol = Int.Table.find_exn subid_to_sym subid in
-      String.Table.set latest_trades symbol t ;
-      on_trade_update symbol t
-  in
   let on_msg msg =
     let now = Time_ns.now () in
     latest_ts := now ;
@@ -663,11 +661,11 @@ let logon_request addr w msg =
       DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
     Log.debug log_dtc "-> [%s] Logon Response (%s)" addr result_text ;
     if not !sc_mode || send_secdefs then begin
-      String.Table.iter tickers ~f:begin fun (ts, t) ->
-        let secdef = secdef_of_ticker ~final:true t in
+      String.Table.iter tickers ~f:begin fun (ts, { symbol }) ->
+        let secdef = secdef_of_symbol ~final:true symbol in
         write_message w `security_definition_response
           DTC.gen_security_definition_response secdef ;
-        Log.debug log_dtc "Written secdef %s" t.symbol
+        Log.debug log_dtc "Written secdef %s" symbol
       end
     end
   in
@@ -706,8 +704,8 @@ let security_definition_request addr w msg =
       if exchange <> my_exchange then reject addr request_id symbol
       else begin match String.Table.find tickers symbol with
         | None -> reject addr request_id symbol
-        | Some (ts, t) ->
-          let secdef = secdef_of_ticker ~final:true ~request_id t in
+        | Some (ts, { symbol }) ->
+          let secdef = secdef_of_symbol ~final:true ~request_id symbol in
           Log.debug log_dtc "-> [%s] Sec Def Response %ld %s %s"
             addr request_id symbol exchange ;
           write_message w `security_definition_response
@@ -727,9 +725,9 @@ let reject_market_data_request ?id addr w k =
 let write_market_data_snapshot ?id symbol exchange addr w ts t =
   let snap = DTC.default_market_data_snapshot () in
   snap.symbol_id <- id ;
-  snap.session_high_price <- Some t.Ticker.high24h ;
-  snap.session_low_price <- Some t.low24h ;
-  snap.session_volume <- Some t.base_volume ;
+  snap.session_high_price <- String.Table.find session_high symbol ;
+  snap.session_low_price <- String.Table.find session_low symbol ;
+  snap.session_volume <- String.Table.find session_volume symbol ;
   begin match String.Table.find latest_trades symbol with
     | None -> ()
     | Some { gid; id; ts; side; price; qty } ->
@@ -1216,11 +1214,7 @@ let submit_new_single_order conn (req : DTC.submit_new_single_order) =
   begin match Option.value ~default:`order_type_unset req.order_type, req.price1 with
     | `order_type_market, _ ->
       req.price1 <-
-        Option.bind req.symbol ~f:begin fun symbol ->
-          Option.map (String.Table.find tickers symbol) ~f:begin fun (ts, t) ->
-            t.high24h *. 2.
-          end
-        end
+        Option.(req.symbol >>= String.Table.find latest_trades >>| fun { price } -> price *. 2.)
     | `order_type_limit, Some price ->
       req.price1 <- Some price
     | `order_type_limit, None ->
@@ -1535,7 +1529,6 @@ let main update_client_span' heartbeat timeout tls port
       List.iter ts ~f:(fun t -> String.Table.set tickers t.symbol (now, t))
     end >>= fun () ->
     RestSync.Default.run () ;
-    loop_update_tickers () ;
     conduit_server ~tls ~crt_path ~key_path >>= fun server ->
     Deferred.all_unit [
       loop_log_errors ~log:log_dtc (fun () -> ws ?heartbeat timeout) ;
