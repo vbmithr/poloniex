@@ -20,6 +20,7 @@ PKG async_ssl.bindings
 PKG async_unix
 PKG base
 PKG base.caml
+PKG base.md5
 PKG base.shadow_stdlib
 PKG base64
 PKG bigarray
@@ -46,7 +47,6 @@ PKG digestif.c
 PKG easy-format
 PKG fieldslib
 PKG fmt
-PKG integers
 PKG ipaddr
 PKG ipaddr.unix
 PKG jane-street-headers
@@ -79,10 +79,8 @@ PKG ppx_hash.runtime-lib
 PKG ppx_inline_test.config
 PKG ppx_inline_test.runtime-lib
 PKG ppx_optcomp
-# PKG ppx_sexp_conv
 PKG ppx_sexp_conv.expander
 PKG ppx_traverse_builtins
-# PKG ppx_type_conv
 PKG protocol_version_header
 PKG re
 PKG re.emacs
