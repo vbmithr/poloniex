@@ -763,17 +763,18 @@ let market_data_request addr w msg =
   | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
     reject_market_data_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
-    begin match Int32.Table.find rev_subs id with
-    | None -> ()
-    | Some symbol -> String.Table.remove subs symbol
+    Log.debug log_dtc "<- [%s] Market Data Unsubscribe %ld" addr id ;
+    Option.iter (Int32.Table.find rev_subs id) ~f:begin fun symbol ->
+      Log.debug log_dtc "<- [%s] Market Data Unsubscribe %ld %s" addr id symbol ;
+      String.Table.remove subs symbol
     end ;
     Int32.Table.remove rev_subs id
   | Some `snapshot, _, Some symbol, Some exchange ->
+    Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange ;
     let ts, t = String.Table.find_exn tickers symbol in
-    write_market_data_snapshot symbol exchange addr w ts t ;
-    Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
+    write_market_data_snapshot symbol exchange addr w ts t
   | Some `subscribe, Some id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
+    Log.debug log_dtc "<- [%s] Market Data Subscribe %ld %s %s"
       addr id symbol exchange ;
     begin
       match Int32.Table.find rev_subs id with
@@ -789,7 +790,7 @@ let market_data_request addr w msg =
         Log.debug log_dtc "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
     end
   | _ ->
-    reject_market_data_request addr w "Market Data Request: wrong request"
+    reject_market_data_request addr w "invalid request"
 
 let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
   let bid = Book.get_bids symbol in
@@ -856,22 +857,20 @@ let market_depth_request addr w msg =
   | _, id, _, Some exchange when exchange <> my_exchange ->
     reject_market_depth_request ?id addr w "No such exchange %s" exchange
   | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
-    reject_market_data_request ?id addr w "No such symbol %s" symbol
+    reject_market_depth_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
-    begin match Int32.Table.find rev_subs_depth id with
-    | None -> ()
-    | Some symbol -> String.Table.remove subs_depth symbol
+    Log.debug log_dtc "<- [%s] Market Depth Unsubscribe %ld" addr id ;
+    Option.iter (Int32.Table.find rev_subs_depth id) ~f:begin fun symbol ->
+      Log.debug log_dtc "<- [%s] Market Depth Unsubscribe %ld %s" addr id symbol ;
+      String.Table.remove subs_depth symbol
     end ;
     Int32.Table.remove rev_subs_depth id
-  | Some `snapshot, id, Some symbol, Some exchange ->
-    write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels
   | Some `subscribe, Some id, Some symbol, Some exchange ->
-    Log.debug log_dtc "<- [%s] Market Data Request %ld %s %s"
-      addr id symbol exchange ;
+    Log.debug log_dtc "<- [%s] Market Depth Subscribe %ld %s %s" addr id symbol exchange ;
     begin
       match Int32.Table.find rev_subs_depth id with
       | Some symbol' when symbol <> symbol' ->
-        reject_market_data_request addr w ~id
+        reject_market_depth_request addr w ~id
           "Already subscribed to %s-%s with a different id (was %ld)"
           symbol exchange id
       | _ ->
@@ -880,7 +879,7 @@ let market_depth_request addr w msg =
         write_market_depth_snapshot ~id addr w ~symbol ~exchange ~num_levels
     end
   | _ ->
-    reject_market_data_request addr w "Market Data Request: wrong request"
+    reject_market_depth_request addr w "invalid request"
 
 let send_open_order_update w request_id nb_open_orders
     ~key:_ ~data:(symbol, { Rest.OpenOrder.id; side; price; qty; starting_qty; } ) i =
