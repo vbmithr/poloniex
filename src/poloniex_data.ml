@@ -7,6 +7,8 @@ open Cohttp_async
 
 open Bs_devkit
 open Plnx
+open Bmex_common
+
 module REST = Plnx_rest
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
@@ -163,16 +165,6 @@ let mk_store_trade_in_db () =
       DB.store_trade_in_db db ~ts ~price ~qty ~side
 
 let store_trade_in_db = mk_store_trade_in_db ()
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  let typ =
-    Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-  let msg = (gen msg |> Piqirun.to_string) in
-  let header = Bytes.create 4 in
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-  Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-  Writer.write w header ;
-  Writer.write w msg
 
 module Granulator = struct
   type t = {
@@ -467,7 +459,7 @@ let dtcserver ~server ~port =
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
-    server (Tcp.on_port port) server_fun
+    server (Tcp.Where_to_listen.of_port port) server_fun
 
 let run ?start port no_pump symbols =
   Instrument.load symbols >>= function
@@ -521,6 +513,6 @@ let command =
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon (sequence ("symbol" %: string))
   in
-  Command.Staged.async ~summary:"Poloniex data aggregator" spec main
+  Command.Staged.async_spec ~summary:"Poloniex data aggregator" spec main
 
 let () = Command.run command

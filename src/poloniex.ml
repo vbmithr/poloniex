@@ -2,23 +2,13 @@ open Core
 open Async
 
 open Plnx
+open Bmex_common
+
 module Rest = Plnx_rest
 module Ws = Plnx_ws_new
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
-
-let write_message w (typ : DTC.dtcmessage_type) gen msg =
-  if Writer.is_open w then begin
-    let typ =
-      Piqirun.(DTC.gen_dtcmessage_type typ |> to_string |> init_from_string |> int_of_varint) in
-    let msg = (gen msg |> Piqirun.to_string) in
-    let header = Bytes.create 4 in
-    Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:0 (4 + String.length msg) ;
-    Binary_packing.pack_unsigned_16_little_endian ~buf:header ~pos:2 typ ;
-    Writer.write w header ;
-    Writer.write w msg
-  end
 
 let rec loop_log_errors ?log f =
   let rec inner () =
@@ -509,14 +499,14 @@ let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
     | `buy ->
       let { Book.book } = Book.get_bids pair in
       let new_book =
-        (if qty > 0. then Float.Map.add book ~key:price ~data:qty
+        (if qty > 0. then Float.Map.set book ~key:price ~data:qty
          else Float.Map.remove book price) in
       Book.set_bids ~symbol:pair ~ts ~book:new_book ;
       book, new_book
     | `sell ->
       let { Book.book } = Book.get_asks pair in
       let new_book =
-        (if qty > 0. then Float.Map.add book ~key:price ~data:qty
+        (if qty > 0. then Float.Map.set book ~key:price ~data:qty
          else Float.Map.remove book price) in
       Book.set_asks ~symbol:pair ~ts ~book:new_book ;
       book, new_book
@@ -1490,7 +1480,7 @@ let dtcserver ~server ~port =
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
-    server (Tcp.on_port port) server_fun
+    server (Tcp.Where_to_listen.of_port port) server_fun
 
 let loglevel_of_int = function 2 -> `Info | 3 -> `Debug | _ -> `Error
 
@@ -1554,6 +1544,6 @@ let command =
     +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
     +> flag "-sc" no_arg ~doc:" Sierra Chart mode."
   in
-  Command.Staged.async ~summary:"Poloniex bridge" spec main
+  Command.Staged.async_spec ~summary:"Poloniex bridge" spec main
 
 let () = Command.run command
