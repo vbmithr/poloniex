@@ -1485,7 +1485,7 @@ let dtcserver ~server ~port =
 let loglevel_of_int = function 2 -> `Info | 3 -> `Debug | _ -> `Error
 
 let main update_client_span' heartbeat timeout tls port
-    daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
+    pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
   let timeout = Time_ns.Span.of_string timeout in
   sc_mode := sc ;
   update_client_span := Time_ns.Span.of_string update_client_span';
@@ -1499,7 +1499,6 @@ let main update_client_span' heartbeat timeout tls port
   Log.set_level log_dtc @@ loglevel_of_int @@ max loglevel ll_dtc;
   Log.set_level log_plnx @@ loglevel_of_int @@ max loglevel ll_plnx;
 
-  if daemon then Daemon.daemonize ~cd:"." ();
   stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
@@ -1534,7 +1533,6 @@ let command =
     +> flag "-timeout" (optional_with_default "60s" string) ~doc:" max Disconnect if no message received in N seconds (default: 60s)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
     +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
-    +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-pidfile" (optional_with_default "run/plnx.pid" string) ~doc:"filename Path of the pid file (run/plnx.pid)"
     +> flag "-logfile" (optional_with_default "log/plnx.log" string) ~doc:"filename Path of the log file (log/plnx.log)"
     +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 global loglevel"

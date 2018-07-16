@@ -479,11 +479,10 @@ let run ?start port no_pump symbols =
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
 
-let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel symbols () =
+let main dry_run' no_pump start port datadir pidfile logfile loglevel symbols () =
   dry_run := dry_run';
   Instrument.set_datadir datadir ;
   set_level @@ loglevel_of_int loglevel;
-  if daemon then Daemon.daemonize ~cd:"." ();
   Signal.handle Signal.terminating ~f:begin fun _ ->
     info "Data server stopping";
     don't_wait_for begin
@@ -506,7 +505,6 @@ let command =
     +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
     +> flag "-start" (optional date) ~doc:"date Start gathering history at DATE (default: 2017-01-01)"
     +> flag "-port" (optional_with_default 5574 int) ~doc:"int TCP port to use (5574)"
-    +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-datadir" (optional_with_default (Filename.concat "data" "poloniex") string) ~doc:"path Where to store DBs (data)"
     +> flag "-pidfile" (optional_with_default (Filename.concat "run" "plnx_data.pid") string) ~doc:"filename Path of the pid file (run/plnx_data.pid)"
     +> flag "-logfile" (optional_with_default (Filename.concat "log" "plnx_data.log") string) ~doc:"filename Path of the log file (log/plnx_data.log)"
