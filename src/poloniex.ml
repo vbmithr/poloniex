@@ -1500,11 +1500,17 @@ let main update_client_span' heartbeat timeout tls port
   Log.set_level log_plnx @@ loglevel_of_int @@ max loglevel ll_plnx;
 
   stage begin fun `Scheduler_started ->
-    Lock_file.create_exn pidfile >>= fun () ->
-    Writer.open_file ~append:true logfile >>= fun log_writer ->
-    Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
-    Log.(set_output log_plnx Output.[stderr (); writer `Text log_writer]);
-
+    begin match pidfile with
+      | None -> Deferred.unit
+      | Some pidfile -> Lock_file.create_exn pidfile
+    end >>= fun () ->
+    begin match logfile with
+      | None -> Deferred.unit
+      | Some logfile ->
+        Writer.open_file ~append:true logfile >>| fun log_writer ->
+        Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
+        Log.(set_output log_plnx Output.[stderr (); writer `Text log_writer]);
+    end >>= fun () ->
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
     | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
@@ -1533,8 +1539,8 @@ let command =
     +> flag "-timeout" (optional_with_default "60s" string) ~doc:" max Disconnect if no message received in N seconds (default: 60s)"
     +> flag "-tls" no_arg ~doc:" Use TLS"
     +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
-    +> flag "-pidfile" (optional_with_default "run/plnx.pid" string) ~doc:"filename Path of the pid file (run/plnx.pid)"
-    +> flag "-logfile" (optional_with_default "log/plnx.log" string) ~doc:"filename Path of the log file (log/plnx.log)"
+    +> flag "-pidfile" (optional string) ~doc:"filename Path of the pid file"
+    +> flag "-logfile" (optional string) ~doc:"filename Path of the log file"
     +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 global loglevel"
     +> flag "-loglevel-dtc" (optional_with_default 2 int) ~doc:"1-3 loglevel for DTC"
     +> flag "-loglevel-plnx" (optional_with_default 2 int) ~doc:"1-3 loglevel for PLNX"
