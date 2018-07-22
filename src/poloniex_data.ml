@@ -180,7 +180,7 @@ module Granulator = struct
       ~ts ~price ~qty ~side ~span () =
     let record = DTC.default_historical_price_data_record_response () in
     record.request_id <- request_id ;
-    record.start_date_time <- Some (seconds_int64_of_ts ts) ;
+    record.start_date_time <- Some (Int63.to_int64 (seconds_int63_of_ts ts)) ;
     record.open_price <- Some price ;
     record.high_price <- Some price ;
     record.low_price <- Some price ;
@@ -314,7 +314,7 @@ let stream_tick_responses symbol
         | `buy -> `at_ask
         | `sell -> `at_bid
         | `buy_sell_unset -> `bid_ask_unset in
-      resp.date_time <- Some (float_of_ts t.ts) ;
+      resp.date_time <- Some (seconds_float_of_ts t.ts) ;
       resp.price <- Some p ;
       resp.volume <- Some v ;
       resp.at_bid_or_ask <- Some side ;
