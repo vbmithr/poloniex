@@ -1,5 +1,15 @@
-(executables
- ((names (poloniex poloniex_data))
-  (public_names (poloniex poloniex-data))
+(executable
+ ((name poloniex)
+  (public_name poloniex)
+  (modules (poloniex))
+  (package poloniex)
+  (preprocess (pps (ppx_sexp_conv)))
+  (libraries (bs-devkit bmex-common dtc-pb plnx-rest plnx-ws-new))))
+
+(executable
+ ((name poloniex_data)
+  (public_name poloniex-data)
+  (modules (poloniex_data))
+  (package poloniex-data)
   (preprocess (pps (ppx_sexp_conv)))
   (libraries (bitv bs-devkit bmex-common leveldb tick dtc-pb plnx-rest plnx-ws-new))))
