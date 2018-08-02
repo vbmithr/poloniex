@@ -400,9 +400,10 @@ module Connection = struct
     end
 end
 
-let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
-let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
-let int32_of_time ts = Int32.of_int64_exn (int64_of_time ts)
+let float_of_time ts = Int63.to_float (Time_ns.to_int63_ns_since_epoch ts) /. 1e9
+let int63_of_time ts = Int63.(Time_ns.to_int63_ns_since_epoch ts / of_int 1_000_000_000)
+let int64_of_time ts = Int63.to_int64 (int63_of_time ts)
+let int32_of_time ts = Int63.to_int32_exn (int63_of_time ts)
 
 let at_bid_or_ask_of_depth : Side.t -> DTC.at_bid_or_ask_enum = function
   | `buy -> `at_bid
