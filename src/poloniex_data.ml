@@ -2,7 +2,6 @@
 
 open Core
 open Async
-open Log.Global
 open Cohttp_async
 
 open Bs_devkit
@@ -17,6 +16,9 @@ module DB = struct
   let store_trade_in_db ?sync db ~ts ~price ~qty ~side =
     put_tick ?sync db @@ Tick.create ~ts ~side ~p:price ~v:qty ()
 end
+
+let src =
+  Logs.Src.create "poloniex.data" ~doc:"Poloniex data collector"
 
 module CtrlFile = struct
   type t = {
@@ -35,7 +37,7 @@ module CtrlFile = struct
         Caml.close_in ic ;
         raise exn
     with exn ->
-      error "CtrlFile.open_file: %s" (Exn.to_string exn) ;
+      Logs.err ~src (fun m -> m "CtrlFile.open_file: %a" Exn.pp exn) ;
       { fn ; bitv = Bitv.create (365 * 24 * 10) false }
 
   let close { fn ; bitv } =
@@ -64,14 +66,14 @@ module CtrlFile = struct
         if i >= 0 then begin
             if not (Bitv.get bitv i) || latest then
               begin fun () -> f ~start_ts ~end_ts >>| function
-                | Error err -> error "%s" (REST.Http_error.to_string err)
+                | Error err -> Logs.err ~src (fun m -> m "%a" REST.Http_error.pp err)
                 | Ok _ -> Bitv.set bitv i true
               end :: thunks
             else thunks
           end
         else begin fun () ->
           f ~start_ts ~end_ts >>| Result.iter_error ~f:begin fun err ->
-            error "%s" (REST.Http_error.to_string err)
+            Logs.err ~src (fun m -> m "%a" REST.Http_error.pp err)
           end
         end :: thunks
       in
@@ -100,18 +102,16 @@ module Instrument = struct
     !datadir // "ctrl" // symbol
 
   let load symbols =
-    Deferred.Result.bind
-      (REST.symbols ~log:(Lazy.force log) ()) ~f:begin fun all_symbols ->
-      let symbols_in_use =
-        if String.Set.is_empty symbols then all_symbols
-        else String.Set.(inter (of_list all_symbols) symbols |> to_list) in
-      List.map symbols_in_use ~f:begin fun symbol ->
-        let db = DB.open_db (db_path symbol) in
-        let ctrl = CtrlFile.open_file (ctrl_path symbol) in
-        info "Loaded instrument %s" symbol ;
-        symbol, create ~db ~ctrl
-      end |> fun res ->
-      return (Ok res)
+    let open Deferred.Result.Monad_infix in
+    REST.symbols () >>| fun all_symbols ->
+    let symbols_in_use =
+      if String.Set.is_empty symbols then all_symbols
+      else String.Set.(inter (of_list all_symbols) symbols |> to_list) in
+    List.map symbols_in_use ~f:begin fun symbol ->
+      let db = DB.open_db (db_path symbol) in
+      let ctrl = CtrlFile.open_file (ctrl_path symbol) in
+      Logs.info ~src (fun m -> m "Loaded instrument %s" symbol) ;
+      symbol, create ~db ~ctrl
     end
 
   let active : t String.Table.t = String.Table.create ()
@@ -140,7 +140,7 @@ module Instrument = struct
         close data ;
         succ a
       end in
-    info "Saved %d dbs" nb_closed
+    Logs.info ~src (fun m -> m "Saved %d dbs" nb_closed)
 end
 
 let dry_run = ref false
@@ -233,7 +233,7 @@ module Granulator = struct
 end
 
 let pump symbol ~start_ts ~end_ts =
-  REST.trades ~log:(Lazy.force log) ~start_ts ~end_ts symbol >>= function
+  REST.trades ~start_ts ~end_ts symbol >>= function
   | Error err -> return (Error err)
   | Ok trades ->
     Pipe.fold_without_pushback trades
@@ -241,18 +241,20 @@ let pump symbol ~start_ts ~end_ts =
       store_trade_in_db symbol t ;
       succ nb_trades, t.ts
     end >>= fun (nb_trades, last_ts) ->
-    debug "pumped %d trades from %s to %s" nb_trades
-      (Time_ns.to_string start_ts) (Time_ns.to_string end_ts) ;
+    Logs_async.debug ~src begin fun m ->
+      m "pumped %d trades from %a to %a" nb_trades
+        Time_ns.pp start_ts Time_ns.pp end_ts
+    end >>= fun () ->
     Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
     Ok ()
 
 (* A DTC Historical Price Server. *)
 
 let encoding_request addr w req =
-  debug "<- [%s] Encoding Request" addr ;
+  Logs.debug ~src (fun m -> m "<- [%s] Encoding Request" addr) ;
   Dtc_pb.Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
   Writer.write w ;
-  debug "-> [%s] Encoding Response" addr
+  Logs.debug ~src (fun m -> m "-> [%s] Encoding Response" addr)
 
 let accept_logon_request addr w req =
   let r = DTC.default_logon_response () in
@@ -264,15 +266,15 @@ let accept_logon_request addr w req =
   r.historical_price_data_supported <- Some true ;
   r.one_historical_price_data_request_per_connection <- Some true ;
   write_message w `logon_response DTC.gen_logon_response r ;
-  debug "-> [%s] Logon Response" addr
+  Logs.debug ~src (fun m -> m "-> [%s] Logon Response" addr)
 
 let logon_request addr w msg =
   let req = DTC.parse_logon_request msg in
-  debug "<- [%s] Logon Request" addr ;
+  Logs.debug ~src (fun m -> m "<- [%s] Logon Request" addr) ;
   accept_logon_request addr w req
 
 let heartbeat addr w msg =
-  debug "<- [%s] Heartbeat" addr
+  Logs.debug ~src (fun m -> m "<- [%s] Heartbeat" addr)
 
 let reject_historical_price_data_request ?reason_code w (req : DTC.Historical_price_data_request.t) k =
   let rej = DTC.default_historical_price_data_reject () in
@@ -282,7 +284,7 @@ let reject_historical_price_data_request ?reason_code w (req : DTC.Historical_pr
     rej.reject_text <- Some reject_text ;
     write_message w `historical_price_data_reject
       DTC.gen_historical_price_data_reject rej ;
-    debug "-> HistoricalPriceData reject %s" reject_text
+    Logs.debug ~src (fun m -> m "-> HistoricalPriceData reject %s" reject_text)
   end k
 
 let span_of_interval = function
@@ -302,7 +304,7 @@ let start_key = Bytes.create 8
 
 let stream_tick_responses symbol
     ?stop db w (req : DTC.Historical_price_data_request.t) start =
-  info "Streaming %s from %s (tick)" symbol Time_ns.(to_string start) ;
+  Logs.info ~src (fun m -> m "Streaming %s from %a (tick)" symbol Time_ns.pp start) ;
   let resp = DTC.default_historical_price_data_tick_record_response () in
   resp.request_id <- req.request_id ;
   resp.is_final_record <- Some false ;
@@ -331,8 +333,10 @@ let stream_tick_responses symbol
 
 let stream_record_responses symbol
     ?stop db w (req : DTC.Historical_price_data_request.t) start span =
-  info "Streaming %s from %s (%s)" symbol
-    Time_ns.(to_string start) (Time_ns.Span.to_string span) ;
+  Logs.info ~src begin fun m ->
+    m "Streaming %s from %a (%a)" symbol
+      Time_ns.pp start Time_ns.Span.pp span
+  end ;
   let add_tick = Granulator.add_tick ~w ?request_id:req.request_id ~span in
   let r =
     DB.HL.fold_left db ~start ?stop ~init:None ~f:begin fun a t ->
@@ -380,7 +384,7 @@ let historical_price_data_request addr w msg =
   let req = DTC.parse_historical_price_data_request msg in
   begin match req.symbol, req.exchange with
     | Some symbol, Some exchange ->
-      debug "<- [%s] Historical Data Request %s %s" addr symbol exchange ;
+      Logs.debug ~src (fun m -> m "<- [%s] Historical Data Request %s %s" addr symbol exchange) ;
     | _ -> ()
   end ;
   let span =
@@ -403,8 +407,10 @@ let historical_price_data_request addr w msg =
         In_thread.run begin fun () ->
           accept_historical_price_data_request w req db symbol span
         end >>| fun (nb_streamed, nb_processed) ->
-        info "Streamed %d/%d records from %s"
-          nb_streamed nb_processed symbol
+        Logs.info ~src begin fun m ->
+          m "Streamed %d/%d records from %s"
+            nb_streamed nb_processed symbol
+        end
       end
 
 let dtcserver ~server ~port =
@@ -415,7 +421,9 @@ let dtcserver ~server ~port =
       if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
       else
         let msglen = Bigstring.unsafe_get_int16_le buf ~pos in
-        debug "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen;
+        Logs.debug ~src begin fun m ->
+          m "handle_chunk: pos=%d len=%d, msglen=%d" pos len msglen
+        end ;
         if len < msglen then return @@ `Consumed (consumed, `Need msglen)
         else begin
           let msgtype_int = Bigstring.unsafe_get_int16_le buf ~pos:(pos+2) in
@@ -426,23 +434,23 @@ let dtcserver ~server ~port =
           begin match msgtype with
             | `encoding_request ->
               begin match (Dtc_pb.Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
-                | None -> error "Invalid encoding request received"
+                | None -> Logs.err ~src (fun m -> m "Invalid encoding request received")
                 | Some msg -> encoding_request addr w msg
               end
             | `logon_request -> logon_request addr w msg
             | `heartbeat -> heartbeat addr w msg
             | `historical_price_data_request -> historical_price_data_request addr w msg
             | #DTC.dtcmessage_type ->
-              error "Unknown msg type %d" msgtype_int
+              Logs.err ~src (fun m -> m "Unknown msg type %d" msgtype_int)
           end ;
           handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
         end
     in
     let on_connection_io_error exn =
-      error "on_connection_io_error (%s): %s" addr Exn.(to_string exn)
+      Logs.err ~src (fun m -> m "on_connection_io_error (%s): %a" addr Exn.pp exn)
     in
     let cleanup () =
-      info "client %s disconnected" addr ;
+      Logs_async.info ~src (fun m -> m "client %s disconnected" addr) >>= fun () ->
       Deferred.all_unit [Writer.close w; Reader.close r]
     in
     Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
@@ -454,8 +462,10 @@ let dtcserver ~server ~port =
     match Monitor.extract_exn exn with
     | Exit -> ()
     | exn ->
-      error "on_handler_error (%s): %s"
-        Socket.Address.(to_string addr) Exn.(to_string exn)
+      Logs.err ~src begin fun m ->
+        m "on_handler_error (%s): %a"
+          Socket.Address.(to_string addr) Exn.pp exn
+      end
   in
   Conduit_async.serve
     ~on_handler_error:(`Call on_handler_error_f)
@@ -464,10 +474,9 @@ let dtcserver ~server ~port =
 let run ?start port no_pump symbols =
   Instrument.load symbols >>= function
   | Error err ->
-    error "%s" (REST.Http_error.to_string err) ;
-    Deferred.unit
+    Logs_async.err ~src (fun m -> m "%a" REST.Http_error.pp err)
   | Ok symbols ->
-    info "Data server starting";
+    Logs_async.info ~src (fun m -> m "Data server starting") >>= fun () ->
     dtcserver ~server:`TCP ~port >>= fun server ->
     Deferred.all_unit [
       Tcp.Server.close_finished server ;
@@ -482,18 +491,16 @@ let run ?start port no_pump symbols =
 let main dry_run' no_pump start port datadir pidfile logfile loglevel symbols () =
   dry_run := dry_run';
   Instrument.set_datadir datadir ;
-  set_level @@ loglevel_of_int loglevel;
   Signal.handle Signal.terminating ~f:begin fun _ ->
-    info "Data server stopping";
     don't_wait_for begin
       Instrument.shutdown () ;
+      Logs_async.info (fun m -> m "Data server stopping") >>= fun () ->
       Shutdown.exit 0
     end
   end ;
   stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
-    set_output Log.Output.[stderr (); writer `Text log_writer];
     run ?start port no_pump (String.Set.of_list symbols)
   end
 

@@ -4,7 +4,15 @@
  (modules poloniex)
  (package poloniex)
  (preprocess (pps ppx_sexp_conv))
- (libraries bs-devkit bmex-common dtc-pb plnx-rest plnx-ws-new))
+ (libraries
+  core
+  async
+  logs-async
+  bs-devkit
+  bmex-common
+  dtc-pb
+  plnx-rest
+  plnx-ws-new))
 
 (executable
  (name poloniex_data)
