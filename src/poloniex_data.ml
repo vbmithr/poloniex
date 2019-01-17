@@ -488,7 +488,8 @@ let run ?start port no_pump symbols =
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
 
-let main dry_run' no_pump start port datadir pidfile logfile loglevel symbols () =
+let main dry_run' no_pump start port datadir loglevel symbols =
+  Logs.set_level ~all:true (Some loglevel) ;
   dry_run := dry_run';
   Instrument.set_datadir datadir ;
   Signal.handle Signal.terminating ~f:begin fun _ ->
@@ -499,25 +500,35 @@ let main dry_run' no_pump start port datadir pidfile logfile loglevel symbols ()
     end
   end ;
   stage begin fun `Scheduler_started ->
-    Lock_file.create_exn pidfile >>= fun () ->
-    Writer.open_file ~append:true logfile >>= fun log_writer ->
     run ?start port no_pump (String.Set.of_list symbols)
   end
 
-let command =
-  let spec =
-    let open Command.Spec in
-    empty
-    +> flag "-dry-run" no_arg ~doc:" Do not write trades in DBs"
-    +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
-    +> flag "-start" (optional date) ~doc:"date Start gathering history at DATE (default: 2017-01-01)"
-    +> flag "-port" (optional_with_default 5574 int) ~doc:"int TCP port to use (5574)"
-    +> flag "-datadir" (optional_with_default (Filename.concat "data" "poloniex") string) ~doc:"path Where to store DBs (data)"
-    +> flag "-pidfile" (optional_with_default (Filename.concat "run" "plnx_data.pid") string) ~doc:"filename Path of the pid file (run/plnx_data.pid)"
-    +> flag "-logfile" (optional_with_default (Filename.concat "log" "plnx_data.log") string) ~doc:"filename Path of the log file (log/plnx_data.log)"
-    +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
-    +> anon (sequence ("symbol" %: string))
-  in
-  Command.Staged.async_spec ~summary:"Poloniex data aggregator" spec main
-
-let () = Command.run command
+let () =
+  let open Command.Let_syntax in
+  let open Arg_type in
+  Command.Staged.async ~summary:"Poloniex data aggregator"
+    [%map_open
+      let dry_run =
+        flag "dry-run" no_arg ~doc:" Do not write trades in DBs"
+      and no_pump =
+        flag "no-pump" no_arg ~doc:" Do not pump trades"
+      and start =
+        flag "start" (optional date) ~doc:"date Start gathering history at DATE"
+      and port =
+        flag_optional_with_default_doc "port"
+          int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
+      and datadir =
+        flag_optional_with_default_doc "datadir" file String.sexp_of_t
+          ~default:(Filename.concat "data" "poloniex")
+          ~doc:"path Where to store DBs (data)"
+      and loglevel =
+        flag_optional_with_default_doc "loglevel-app"
+          loglevel sexp_of_loglevel
+          ~default:Logs.Info
+          ~doc:"level loglevel for this executable"
+      and symbols =
+        anon (sequence ("symbol" %: string)) in
+      fun () ->
+        main dry_run no_pump start port datadir loglevel symbols
+    ]
+  |> Command.run

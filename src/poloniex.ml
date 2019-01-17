@@ -24,15 +24,15 @@ let rec loop_log_errors ?log f =
       inner ()
   in inner ()
 
-let conduit_server ~tls ~crt_path ~key_path =
-  if tls then
-    Sys.file_exists crt_path >>= fun crt_exists ->
-    Sys.file_exists key_path >>| fun key_exists ->
+let conduit_server ?tls () =
+  match tls with
+  | None -> return `TCP
+  | Some (crt, key) ->
+    Sys.file_exists crt >>= fun crt_exists ->
+    Sys.file_exists key >>| fun key_exists ->
     match crt_exists, key_exists with
-    | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt_path, `Key_file_path key_path)
+    | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt, `Key_file_path key)
     | _ -> failwith "TLS crt/key file not found"
-  else
-  return `TCP
 
 let my_exchange = "PLNX"
 let exchange_account = "exchange"
@@ -1593,34 +1593,20 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let loglevel_of_int = function
-  | 2 -> Logs.Info
-  | 3 -> Debug
-  | _ -> Error
-
-let main update_client_span' heartbeat timeout tls port
-    pidfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
+let main span heartbeat timeout tls port loglevel loglevel_libs sc () =
   List.iter (Logs.Src.list ()) ~f:begin fun s ->
     match Logs.Src.name s with
-    | "poloniex" ->
-      Logs.Src.set_level s (Some (loglevel_of_int (max loglevel ll_plnx)))
-    | _ ->
-      Logs.Src.set_level s (Some (loglevel_of_int (max loglevel ll_dtc)))
+    | "poloniex" -> Logs.Src.set_level s (Some loglevel)
+    | _ -> Logs.Src.set_level s (Some loglevel_libs)
   end ;
-  let timeout = Time_ns.Span.of_string timeout in
   sc_mode := sc ;
-  update_client_span := Time_ns.Span.of_string update_client_span';
-  let heartbeat = Option.map heartbeat ~f:Time_ns.Span.of_string in
+  update_client_span := span ;
   let dtcserver ~server ~port =
     dtcserver ~server ~port >>= fun dtc_server ->
     Logs_async.info ~src (fun m -> m "DTC server started") >>= fun () ->
     Tcp.Server.close_finished dtc_server
   in
   stage begin fun `Scheduler_started ->
-    begin match pidfile with
-      | None -> Deferred.unit
-      | Some pidfile -> Lock_file.create_exn pidfile
-    end >>= fun () ->
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
     | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
@@ -1633,30 +1619,58 @@ let main update_client_span' heartbeat timeout tls port
       List.iter ts ~f:(fun t -> String.Table.set tickers t.symbol (now, t))
     end >>= fun () ->
     RestSync.Default.run () ;
-    conduit_server ~tls ~crt_path ~key_path >>= fun server ->
+    conduit_server ?tls () >>= fun server ->
     Deferred.all_unit [
       loop_log_errors (fun () -> ws ?heartbeat timeout) ;
       loop_log_errors (fun () -> dtcserver ~server ~port) ;
     ]
   end
 
-let command =
-  let spec =
-    let open Command.Spec in
-    empty
-    +> flag "-update-client−span" (optional_with_default "30s" string) ~doc:"span Span between client updates (default: 10s)"
-    +> flag "-heartbeat" (optional string) ~doc:" WS heartbeat period (default: 25s)"
-    +> flag "-timeout" (optional_with_default "60s" string) ~doc:" max Disconnect if no message received in N seconds (default: 60s)"
-    +> flag "-tls" no_arg ~doc:" Use TLS"
-    +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
-    +> flag "-pidfile" (optional string) ~doc:"filename Path of the pid file"
-    +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 global loglevel"
-    +> flag "-loglevel-dtc" (optional_with_default 2 int) ~doc:"1-3 loglevel for DTC"
-    +> flag "-loglevel-plnx" (optional_with_default 2 int) ~doc:"1-3 loglevel for PLNX"
-    +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
-    +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
-    +> flag "-sc" no_arg ~doc:" Sierra Chart mode."
-  in
-  Command.Staged.async_spec ~summary:"Poloniex bridge" spec main
-
-let () = Command.run command
+let () =
+  let open Bs_devkit in
+  let open Bs_devkit.Arg_type in
+  let open Command.Let_syntax in
+  Command.Staged.async ~summary:"Poloniex bridge"
+    [%map_open
+      let client_span =
+        flag_optional_with_default_doc "update-client-span"
+          span Time_ns.Span.sexp_of_t
+          ~default:(Time_ns.Span.of_int_sec 30)
+          ~doc:"span Span between client updates"
+      and heartbeat =
+        flag "heartbeat" (optional span) ~doc:" WS heartbeat period"
+      and timeout =
+        flag_optional_with_default_doc "timeout"
+          span Time_ns.Span.sexp_of_t
+          ~default:(Time_ns.Span.of_int_sec 60)
+          ~doc:"span Max Disconnect if no message received in N seconds"
+      and port =
+        flag_optional_with_default_doc "port"
+          int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
+      and loglevel =
+        flag_optional_with_default_doc "loglevel-app"
+          loglevel sexp_of_loglevel
+          ~default:Logs.Info
+          ~doc:"level loglevel for this executable"
+      and loglevel_libs =
+        flag_optional_with_default_doc "loglevel-libs"
+          loglevel sexp_of_loglevel
+          ~default:Logs.Info
+          ~doc:"level loglevel for libraries used by this executable"
+      and crt =
+        flag "crt-file" (optional file)
+          ~doc:"filename crt file to use (TLS)"
+      and key =
+        flag "key-file" (optional file)
+          ~doc:"filename key file to use (TLS)"
+      and sc =
+        flag "sc" no_arg ~doc:" Sierra Chart mode" in
+      fun () ->
+        let tls =
+          match crt, key with
+          | Some crt, Some key -> Some (crt, key)
+          | _ -> None in
+        main
+          client_span heartbeat timeout tls port loglevel loglevel_libs sc ()
+    ]
+  |> Command.run
