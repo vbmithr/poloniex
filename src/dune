@@ -8,6 +8,7 @@
   core
   async
   logs-async
+  logs-async-ovh
   bs-devkit
   bmex-common
   dtc-pb

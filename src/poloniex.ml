@@ -1593,7 +1593,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat timeout tls port loglevel loglevel_libs sc () =
+let main span heartbeat timeout tls port loglevel loglevel_libs logs sc () =
   List.iter (Logs.Src.list ()) ~f:begin fun s ->
     match Logs.Src.name s with
     | "poloniex" -> Logs.Src.set_level s (Some loglevel)
@@ -1607,6 +1607,8 @@ let main span heartbeat timeout tls port loglevel loglevel_libs sc () =
     Tcp.Server.close_finished dtc_server
   in
   stage begin fun `Scheduler_started ->
+    Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
+    Logs.set_reporter reporter ;
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
     | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
@@ -1630,6 +1632,11 @@ let () =
   let open Bs_devkit in
   let open Bs_devkit.Arg_type in
   let open Command.Let_syntax in
+  let uri_token = Command.Arg_type.create begin fun s ->
+      match String.split s ~on:',' with
+      | uri :: token :: _ -> Uri.of_string uri, token
+      | _ -> invalid_arg "uri_token"
+    end in
   Command.Staged.async ~summary:"Poloniex bridge"
     [%map_open
       let client_span =
@@ -1657,6 +1664,8 @@ let () =
           loglevel sexp_of_loglevel
           ~default:Logs.Info
           ~doc:"level loglevel for libraries used by this executable"
+      and log_creds =
+        flag "log-uri" (optional uri_token) ~doc:"url,token Credentials for OVH log service"
       and crt =
         flag "crt-file" (optional file)
           ~doc:"filename crt file to use (TLS)"
@@ -1671,6 +1680,7 @@ let () =
           | Some crt, Some key -> Some (crt, key)
           | _ -> None in
         main
-          client_span heartbeat timeout tls port loglevel loglevel_libs sc ()
+          client_span heartbeat timeout tls
+          port loglevel loglevel_libs log_creds sc ()
     ]
   |> Command.run
