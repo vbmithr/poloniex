@@ -488,8 +488,7 @@ let run ?start port no_pump symbols =
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
 
-let main dry_run' no_pump start port datadir loglevel symbols =
-  Logs.set_level ~all:true (Some loglevel) ;
+let main dry_run' no_pump start port datadir symbols =
   dry_run := dry_run';
   Instrument.set_datadir datadir ;
   Signal.handle Signal.terminating ~f:begin fun _ ->
@@ -521,14 +520,11 @@ let () =
         flag_optional_with_default_doc "datadir" file String.sexp_of_t
           ~default:(Filename.concat "data" "poloniex")
           ~doc:"path Where to store DBs (data)"
-      and loglevel =
-        flag_optional_with_default_doc "loglevel-app"
-          loglevel sexp_of_loglevel
-          ~default:Logs.Info
-          ~doc:"level loglevel for this executable"
+      and () =
+        Logs_async_reporter.set_level_via_param None
       and symbols =
         anon (sequence ("symbol" %: string)) in
       fun () ->
-        main dry_run no_pump start port datadir loglevel symbols
+        main dry_run no_pump start port datadir symbols
     ]
   |> Command.run

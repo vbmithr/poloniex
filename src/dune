@@ -8,6 +8,7 @@
   core
   async
   logs-async
+  logs-async-reporter
   logs-async-ovh
   bs-devkit
   bmex-common
@@ -22,6 +23,7 @@
  (package poloniex-data)
  (preprocess (pps ppx_let ppx_sexp_conv))
  (libraries
+  logs-async-reporter
   bitv
   bs-devkit
   bmex-common

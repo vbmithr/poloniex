@@ -1593,12 +1593,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat timeout tls port loglevel loglevel_libs logs sc () =
-  List.iter (Logs.Src.list ()) ~f:begin fun s ->
-    match Logs.Src.name s with
-    | "poloniex" -> Logs.Src.set_level s (Some loglevel)
-    | _ -> Logs.Src.set_level s (Some loglevel_libs)
-  end ;
+let main span heartbeat timeout tls port logs sc () =
   sc_mode := sc ;
   update_client_span := span ;
   let dtcserver ~server ~port =
@@ -1654,16 +1649,6 @@ let () =
       and port =
         flag_optional_with_default_doc "port"
           int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
-      and loglevel =
-        flag_optional_with_default_doc "loglevel-app"
-          loglevel sexp_of_loglevel
-          ~default:Logs.Info
-          ~doc:"level loglevel for this executable"
-      and loglevel_libs =
-        flag_optional_with_default_doc "loglevel-libs"
-          loglevel sexp_of_loglevel
-          ~default:Logs.Info
-          ~doc:"level loglevel for libraries used by this executable"
       and log_creds =
         flag "log-uri" (optional uri_token) ~doc:"url,token Credentials for OVH log service"
       and crt =
@@ -1673,7 +1658,9 @@ let () =
         flag "key-file" (optional file)
           ~doc:"filename key file to use (TLS)"
       and sc =
-        flag "sc" no_arg ~doc:" Sierra Chart mode" in
+        flag "sc" no_arg ~doc:" Sierra Chart mode"
+      and () =
+        Logs_async_reporter.set_level_via_param None in
       fun () ->
         let tls =
           match crt, key with
@@ -1681,6 +1668,6 @@ let () =
           | _ -> None in
         main
           client_span heartbeat timeout tls
-          port loglevel loglevel_libs log_creds sc ()
+          port log_creds sc ()
     ]
   |> Command.run
