@@ -2,7 +2,6 @@
 
 open Core
 open Async
-open Cohttp_async
 
 open Bs_devkit
 open Plnx
@@ -55,7 +54,7 @@ module CtrlFile = struct
   let genesis_ts =
     Time_ns.(of_date_ofday ~zone:Time.Zone.utc genesis_date Ofday.start_of_day)
 
-  let jobs ?(start=genesis_date) { bitv } f =
+  let jobs ?(start=genesis_date) { bitv ; _ } f =
     let idx = 24 * Date.diff start genesis_date in
     let now_ts = Time_ns.now () in
     let rec inner (i, thunks) =
@@ -121,13 +120,13 @@ module Instrument = struct
   let load symbols =
     Deferred.Result.map (load symbols) ~f:begin fun instruments ->
       List.fold_left instruments ~init:[] ~f:begin fun a (symbol, i) ->
-        String.Table.add_exn active symbol i ;
+        String.Table.add_exn active ~key:symbol ~data:i ;
         symbol :: a
       end
     end
 
   let thunks_exn ?start symbol f =
-    let { ctrl } = find_exn symbol in
+    let { ctrl ; _ } = find_exn symbol in
     CtrlFile.jobs ?start ctrl f
 
   let close { db ; ctrl } =
@@ -147,17 +146,17 @@ let dry_run = ref false
 
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
-  fun symbol { Trade.ts; price; qty; side } ->
+  fun symbol { Trade.ts; price; qty; side; _ } ->
     if !dry_run || side = `buy_sell_unset then ()
     else
-      let { Instrument.db } = Instrument.find_exn symbol in
+      let { Instrument.db; _ } = Instrument.find_exn symbol in
       let ts = match String.Table.find tss symbol with
         | None ->
-          String.Table.add_exn tss symbol (ts, 0); ts
+          String.Table.add_exn tss ~key:symbol ~data:(ts, 0); ts
         | Some (old_ts, _) when old_ts <> ts ->
-          String.Table.set tss symbol (ts, 0); ts
+          String.Table.set tss ~key:symbol ~data:(ts, 0); ts
         | Some (_, n) ->
-          String.Table.set tss symbol (ts, succ n);
+          String.Table.set tss ~key:symbol ~data:(ts, succ n);
           Time_ns.(add ts @@ Span.of_int_ns @@ succ n)
       in
       let price = satoshis_int_of_float_exn price |> Int63.of_int in
@@ -237,10 +236,10 @@ let pump symbol ~start_ts ~end_ts =
   | Error err -> return (Error err)
   | Ok trades ->
     Pipe.fold_without_pushback trades
-      ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, last_ts) t ->
+      ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, _last_ts) t ->
       store_trade_in_db symbol t ;
       succ nb_trades, t.ts
-    end >>= fun (nb_trades, last_ts) ->
+    end >>= fun (nb_trades, _last_ts) ->
     Logs_async.debug ~src begin fun m ->
       m "pumped %d trades from %a to %a" nb_trades
         Time_ns.pp start_ts Time_ns.pp end_ts
@@ -250,13 +249,13 @@ let pump symbol ~start_ts ~end_ts =
 
 (* A DTC Historical Price Server. *)
 
-let encoding_request addr w req =
+let encoding_request addr w =
   Logs.debug ~src (fun m -> m "<- [%s] Encoding Request" addr) ;
   Dtc_pb.Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
   Writer.write w ;
   Logs.debug ~src (fun m -> m "-> [%s] Encoding Response" addr)
 
-let accept_logon_request addr w req =
+let accept_logon_request addr w =
   let r = DTC.default_logon_response () in
   r.protocol_version <- Some 7l ;
   r.server_name <- Some "Poloniex Data" ;
@@ -268,12 +267,11 @@ let accept_logon_request addr w req =
   write_message w `logon_response DTC.gen_logon_response r ;
   Logs.debug ~src (fun m -> m "-> [%s] Logon Response" addr)
 
-let logon_request addr w msg =
-  let req = DTC.parse_logon_request msg in
+let logon_request addr w =
   Logs.debug ~src (fun m -> m "<- [%s] Logon Request" addr) ;
-  accept_logon_request addr w req
+  accept_logon_request addr w
 
-let heartbeat addr w msg =
+let heartbeat addr =
   Logs.debug ~src (fun m -> m "<- [%s] Heartbeat" addr)
 
 let reject_historical_price_data_request ?reason_code w (req : DTC.Historical_price_data_request.t) k =
@@ -403,7 +401,7 @@ let historical_price_data_request addr w msg =
         ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
         w req "No such symbol" ;
       raise Exit
-    | Some { db } -> don't_wait_for begin
+    | Some { db ; _ } -> don't_wait_for begin
         In_thread.run begin fun () ->
           accept_historical_price_data_request w req db symbol span
         end >>| fun (nb_streamed, nb_processed) ->
@@ -435,15 +433,15 @@ let dtcserver ~server ~port =
             | `encoding_request ->
               begin match (Dtc_pb.Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
                 | None -> Logs.err ~src (fun m -> m "Invalid encoding request received")
-                | Some msg -> encoding_request addr w msg
+                | Some _ -> encoding_request addr w
               end
-            | `logon_request -> logon_request addr w msg
-            | `heartbeat -> heartbeat addr w msg
+            | `logon_request -> logon_request addr w
+            | `heartbeat -> heartbeat addr
             | `historical_price_data_request -> historical_price_data_request addr w msg
             | #DTC.dtcmessage_type ->
               Logs.err ~src (fun m -> m "Unknown msg type %d" msgtype_int)
           end ;
-          handle_chunk (consumed + msglen) buf (pos + msglen) (len - msglen)
+          handle_chunk (consumed + msglen) buf ~pos:(pos + msglen) ~len:(len - msglen)
         end
     in
     let on_connection_io_error exn =
@@ -504,7 +502,6 @@ let main dry_run' no_pump start port datadir symbols =
 
 let () =
   let open Command.Let_syntax in
-  let open Arg_type in
   Command.Staged.async ~summary:"Poloniex data aggregator"
     [%map_open
       let dry_run =
