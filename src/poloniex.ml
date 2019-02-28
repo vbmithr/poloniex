@@ -5,7 +5,7 @@ open Plnx
 open Bmex_common
 
 module Rest = Plnx_rest
-module Ws = Plnx_ws_new
+module Ws = Plnx_ws
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
@@ -473,7 +473,7 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
       trade_update.at_bid_or_ask <- Some (at_bid_or_ask_of_trade side) ;
       trade_update.price <- Some price ;
       trade_update.volume <- Some qty ;
-      trade_update.date_time <- Some (float_of_time ts) ;
+      trade_update.date_time <- Some (Ptime.to_float_s ts) ;
       write_message w `market_data_update_trade
         DTC.gen_market_data_update_trade trade_update ;
       Option.iter session_low ~f:begin fun p ->
@@ -574,54 +574,36 @@ let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
   String.Table.iter Connection.active ~f:on_connection
 
 let on_event subid now = function
-  | Ws.Repr.Snapshot { symbol ; bid ; ask } ->
+  | Ws.Snapshot { symbol ; bid ; ask } ->
     Int.Table.set subid_to_sym ~key:subid ~data:symbol ;
     Book.set_bids ~symbol ~ts:now ~book:bid ;
     Book.set_asks ~symbol ~ts:now ~book:ask ;
-  | Update entry ->
+  | BookEntry entry ->
     let symbol = Int.Table.find_exn subid_to_sym subid in
     on_book_update symbol now entry
   | Trade t ->
     let symbol = Int.Table.find_exn subid_to_sym subid in
     on_trade_update symbol t
+  | Ticker _ -> ()
 
-let ws ?heartbeat timeout =
-  let latest_ts = ref Time_ns.epoch in
-  let to_ws, to_ws_w = Pipe.create () in
-  let initialized = ref false in
-  let on_msg msg =
-    let now = Time_ns.now () in
-    latest_ts := now ;
-    match msg with
-    | Ws.Repr.Error msg ->
-      Logs.err ~src (fun m -> m "%s" msg) ;
-    | Event { subid ; id = _ ; events } ->
-      if not !initialized then begin
-        let symbols = String.Table.keys tickers in
-        List.iter symbols ~f:begin fun symbol ->
-          Pipe.write_without_pushback to_ws_w (Ws.Repr.Subscribe symbol)
-        end ;
-        initialized := true
-      end ;
-      List.iter events ~f:(on_event subid now)
-  in
-  let connected = Condition.create () in
-  let restart, ws =
-    Ws.open_connection ?heartbeat ~connected to_ws in
-  let rec handle_init () =
-    Condition.wait connected >>= fun () ->
-    initialized := false ;
-    handle_init () in
-  don't_wait_for (handle_init ()) ;
-  let watchdog () =
-    let now = Time_ns.now () in
-    let diff = Time_ns.diff now !latest_ts in
-    if Time_ns.(!latest_ts <> epoch) && Time_ns.Span.(diff > timeout) then
-      Condition.signal restart () in
-  Clock_ns.every timeout watchdog ;
-  Monitor.handle_errors
-    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_msg)
-    (fun exn -> Logs.err ~src (fun m -> m "%a" Exn.pp exn))
+(* TODO: add watchdog. *)
+let rec ws ?heartbeat () =
+  let symbols = String.Table.keys tickers in
+  Plnx_ws_async.with_connection ?heartbeat begin fun r w ->
+    List.iter symbols ~f:begin fun symbol ->
+      Pipe.write_without_pushback w
+        (Ws.Subscribe (`String symbol, None))
+    end ;
+    let on_msg { Ws.chanid ; seqnum = _ ; events } =
+      let now = Time_ns.now () in
+      List.iter events ~f:(on_event chanid now) in
+    Pipe.iter_without_pushback r ~f:on_msg
+  end >>= fun () ->
+  Logs_async.err ~src begin fun m ->
+    m "Websocket connection terminated. Restarting after 10s."
+  end >>= fun () ->
+  Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
+  ws ?heartbeat ()
 
 let heartbeat addr w ival =
   let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
@@ -681,7 +663,7 @@ let logon_request addr w msg =
       DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
     Logs.debug ~src (fun m -> m "-> [%s] Logon Response (%s)" addr result_text) ;
     if not !sc_mode || send_secdefs then begin
-      String.Table.iter tickers ~f:begin fun (_, { symbol ; _ }) ->
+      String.Table.iteri tickers ~f:begin fun ~key:symbol ~data:_ ->
         let secdef = secdef_of_symbol ~final:true symbol in
         write_message w `security_definition_response
           DTC.gen_security_definition_response secdef ;
@@ -727,9 +709,9 @@ let security_definition_request addr w msg =
           addr request_id symbol exchange
       end ;
       if exchange <> my_exchange then reject addr request_id symbol
-      else begin match String.Table.find tickers symbol with
-        | None -> reject addr request_id symbol
-        | Some (_, { symbol ; _ }) ->
+      else begin match String.Table.mem tickers symbol with
+        | false -> reject addr request_id symbol
+        | true ->
           let secdef = secdef_of_symbol ~final:true ~request_id symbol in
           Logs.debug ~src begin fun m ->
             m "-> [%s] Sec Def Response %ld %s %s"
@@ -762,7 +744,7 @@ let write_market_data_snapshot ?id symbol w =
     | Some { gid = _ ; id = _ ; ts; side = _ ; price; qty } ->
       snap.last_trade_price <- Some price ;
       snap.last_trade_volume <- Some qty ;
-      snap.last_trade_date_time <- Some (float_of_time ts) ;
+      snap.last_trade_date_time <- Some (Ptime.to_float_s ts) ;
   end ;
   let bid = Book.get_bids symbol in
   let ask = Book.get_asks symbol in
@@ -1593,7 +1575,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat timeout tls port logs sc () =
+let main span heartbeat _timeout tls port logs sc () =
   sc_mode := sc ;
   update_client_span := span ;
   let dtcserver ~server ~port =
@@ -1613,12 +1595,14 @@ let main span heartbeat timeout tls port logs sc () =
     Rest.tickers () >>| begin function
     | Error err -> failwithf "tickers: %s" (Rest.Http_error.to_string err) ()
     | Ok ts ->
-      List.iter ts ~f:(fun t -> String.Table.set tickers ~key:t.symbol ~data:(now, t))
+      List.iter ts ~f:begin fun (key, t) ->
+        String.Table.set tickers ~key ~data:(now, t)
+      end
     end >>= fun () ->
     RestSync.Default.run () ;
     conduit_server ?tls () >>= fun server ->
     Deferred.all_unit [
-      loop_log_errors (fun () -> ws ?heartbeat timeout) ;
+      loop_log_errors (fun () -> ws ?heartbeat ()) ;
       loop_log_errors (fun () -> dtcserver ~server ~port) ;
     ]
   end

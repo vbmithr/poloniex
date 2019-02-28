@@ -152,12 +152,14 @@ let mk_store_trade_in_db () =
       let { Instrument.db; _ } = Instrument.find_exn symbol in
       let ts = match String.Table.find tss symbol with
         | None ->
-          String.Table.add_exn tss ~key:symbol ~data:(ts, 0); ts
+          String.Table.add_exn tss ~key:symbol ~data:(ts, 0);
+          REST.of_ptime ts
         | Some (old_ts, _) when old_ts <> ts ->
-          String.Table.set tss ~key:symbol ~data:(ts, 0); ts
+          String.Table.set tss ~key:symbol ~data:(ts, 0);
+          REST.of_ptime ts
         | Some (_, n) ->
           String.Table.set tss ~key:symbol ~data:(ts, succ n);
-          Time_ns.(add ts @@ Span.of_int_ns @@ succ n)
+          Time_ns.(add (REST.of_ptime ts) @@ Span.of_int_ns @@ succ n)
       in
       let price = satoshis_int_of_float_exn price |> Int63.of_int in
       let qty = satoshis_int_of_float_exn qty |> Int63.of_int in
@@ -238,7 +240,7 @@ let pump symbol ~start_ts ~end_ts =
     Pipe.fold_without_pushback trades
       ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, _last_ts) t ->
       store_trade_in_db symbol t ;
-      succ nb_trades, t.ts
+      succ nb_trades, REST.of_ptime t.ts
     end >>= fun (nb_trades, _last_ts) ->
     Logs_async.debug ~src begin fun m ->
       m "pumped %d trades from %a to %a" nb_trades

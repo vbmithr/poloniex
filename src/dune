@@ -14,7 +14,8 @@
   bmex-common
   dtc-pb
   plnx-rest
-  plnx-ws-new))
+  plnx-ws
+  plnx-ws-async))
 
 (executable
  (name poloniex_data)
@@ -31,4 +32,4 @@
   tick
   dtc-pb
   plnx-rest
-  plnx-ws-new))
+  plnx-ws))
