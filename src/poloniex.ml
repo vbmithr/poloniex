@@ -1610,11 +1610,6 @@ let main span heartbeat _timeout tls port logs sc () =
 let () =
   let open Bs_devkit.Arg_type in
   let open Command.Let_syntax in
-  let uri_token = Command.Arg_type.create begin fun s ->
-      match String.split s ~on:',' with
-      | uri :: token :: _ -> Uri.of_string uri, token
-      | _ -> invalid_arg "uri_token"
-    end in
   Command.Staged.async ~summary:"Poloniex bridge"
     [%map_open
       let client_span =
@@ -1632,8 +1627,7 @@ let () =
       and port =
         flag_optional_with_default_doc "port"
           int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
-      and log_creds =
-        flag "log-uri" (optional uri_token) ~doc:"url,token Credentials for OVH log service"
+      and ovh_logs = Logs_async_ovh.ovh_logs
       and crt =
         flag "crt-file" (optional file)
           ~doc:"filename crt file to use (TLS)"
@@ -1651,6 +1645,6 @@ let () =
           | _ -> None in
         main
           client_span heartbeat timeout tls
-          port log_creds sc ()
+          port ovh_logs sc ()
     ]
   |> Command.run
