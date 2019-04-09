@@ -516,7 +516,7 @@ let () =
         flag_optional_with_default_doc "port"
           int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
       and datadir =
-        flag_optional_with_default_doc "datadir" file String.sexp_of_t
+        flag_optional_with_default_doc "datadir" string String.sexp_of_t
           ~default:(Filename.concat "data" "poloniex")
           ~doc:"path Where to store DBs (data)"
       and () =

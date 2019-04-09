@@ -1629,10 +1629,10 @@ let () =
           int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
       and ovh_logs = Logs_async_ovh.ovh_logs
       and crt =
-        flag "crt-file" (optional file)
+        flag "crt-file" (optional string)
           ~doc:"filename crt file to use (TLS)"
       and key =
-        flag "key-file" (optional file)
+        flag "key-file" (optional string)
           ~doc:"filename key file to use (TLS)"
       and sc =
         flag "sc" no_arg ~doc:" Sierra Chart mode"
