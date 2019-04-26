@@ -1575,7 +1575,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat _timeout tls port logs sc () =
+let main span heartbeat _timeout tls port sc () =
   sc_mode := sc ;
   update_client_span := span ;
   let dtcserver ~server ~port =
@@ -1584,6 +1584,11 @@ let main span heartbeat _timeout tls port logs sc () =
     Tcp.Server.close_finished dtc_server
   in
   stage begin fun `Scheduler_started ->
+    let logs = Option.bind (Sys.getenv "OVH_LOGS") ~f:begin fun l ->
+        match String.split l ~on:',' with
+        | [ uri ; token ] -> Some (Uri.of_string uri, token)
+        | _ -> None
+      end in
     Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
@@ -1627,7 +1632,6 @@ let () =
       and port =
         flag_optional_with_default_doc "port"
           int sexp_of_int ~default:5573 ~doc:"int TCP port to use"
-      and ovh_logs = Logs_async_ovh.ovh_logs
       and crt =
         flag "crt-file" (optional string)
           ~doc:"filename crt file to use (TLS)"
@@ -1643,8 +1647,6 @@ let () =
           match crt, key with
           | Some crt, Some key -> Some (crt, key)
           | _ -> None in
-        main
-          client_span heartbeat timeout tls
-          port ovh_logs sc ()
+        main client_span heartbeat timeout tls port sc ()
     ]
   |> Command.run
