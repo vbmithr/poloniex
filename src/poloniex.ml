@@ -1575,7 +1575,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat _timeout tls port sc () =
+let main span heartbeat _timeout tls uid gid port sc () =
   sc_mode := sc ;
   update_client_span := span ;
   let dtcserver ~server ~port =
@@ -1606,6 +1606,8 @@ let main span heartbeat _timeout tls port sc () =
     end >>= fun () ->
     RestSync.Default.run () ;
     conduit_server ?tls () >>= fun server ->
+    Option.iter uid ~f:Core.Unix.setuid ;
+    Option.iter gid ~f:Core.Unix.setgid ;
     Deferred.all_unit [
       loop_log_errors (fun () -> ws ?heartbeat ()) ;
       loop_log_errors (fun () -> dtcserver ~server ~port) ;
@@ -1640,6 +1642,10 @@ let () =
           ~doc:"filename key file to use (TLS)"
       and sc =
         flag "sc" no_arg ~doc:" Sierra Chart mode"
+      and uid =
+        flag "setuid" (optional int) ~doc:" Set uid after reading TLS file"
+      and gid =
+        flag "setgid" (optional int) ~doc:" Set gid after reading TLS file"
       and () =
         Logs_async_reporter.set_level_via_param None in
       fun () ->
@@ -1647,6 +1653,6 @@ let () =
           match crt, key with
           | Some crt, Some key -> Some (crt, key)
           | _ -> None in
-        main client_span heartbeat timeout tls port sc ()
+        main client_span heartbeat timeout tls uid gid port sc ()
     ]
   |> Command.run
