@@ -1584,11 +1584,8 @@ let main span heartbeat _timeout tls uid gid port sc () =
     Tcp.Server.close_finished dtc_server
   in
   stage begin fun `Scheduler_started ->
-    let logs = Option.bind (Sys.getenv "OVH_LOGS") ~f:begin fun l ->
-        match String.split l ~on:',' with
-        | [ uri ; token ] -> Some (Uri.of_string uri, token)
-        | _ -> None
-      end in
+    let logs =
+      Option.Monad_infix.(Sys.getenv "OVH_LOGS_URL" >>| Uri.of_string) in
     Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
