@@ -586,24 +586,38 @@ let on_event subid now = function
     on_trade_update symbol t
   | Ticker _ -> ()
 
-(* TODO: add watchdog. *)
-let rec ws ?heartbeat () =
+let ws () =
   let symbols = String.Table.keys tickers in
-  Plnx_ws_async.with_connection ?heartbeat begin fun r w ->
-    List.iter symbols ~f:begin fun symbol ->
-      Pipe.write_without_pushback w
-        (Ws.Subscribe (`String symbol, None))
-    end ;
-    let on_msg { Ws.chanid ; seqnum = _ ; events } =
+  let latest = ref Time_ns.epoch in
+  let timeout = Time_ns.Span.of_int_sec 10 in
+  let timed_out = Mvar.create () in
+  let terminate_on_timeout stop =
+    Clock_ns.every ~stop timeout begin fun () ->
       let now = Time_ns.now () in
-      List.iter events ~f:(on_event chanid now) in
-    Pipe.iter_without_pushback r ~f:on_msg
-  end >>= fun () ->
-  Logs_async.err ~src begin fun m ->
-    m "Websocket connection terminated. Restarting after 10s."
-  end >>= fun () ->
-  Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
-  ws ?heartbeat ()
+      let d = Time_ns.diff now !latest in
+      if !latest <> Time_ns.epoch && Time_ns.Span.(d > timeout) then
+        Mvar.set timed_out ()
+    end in
+  let rec inner () =
+    Plnx_ws_async.with_connection begin fun r w ->
+      List.iter symbols ~f:begin fun symbol ->
+        Pipe.write_without_pushback w
+          (Ws.Subscribe (`String symbol, None))
+      end ;
+      let on_msg { Ws.chanid ; seqnum = _ ; events } =
+        let now = Time_ns.now () in
+        latest := now ;
+        List.iter events ~f:(on_event chanid now) in
+      let th = Pipe.iter_without_pushback r ~f:on_msg in
+      terminate_on_timeout th ;
+      Deferred.all_unit [ Mvar.take timed_out ; th ]
+    end >>= fun () ->
+    Logs_async.err ~src begin fun m ->
+      m "Websocket connection terminated. Restarting after 10s."
+    end >>= fun () ->
+    Clock_ns.after timeout >>= fun () ->
+    inner () in
+  inner ()
 
 let heartbeat addr w ival =
   let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
@@ -1575,7 +1589,7 @@ let dtcserver ~server ~port =
     ~on_handler_error:(`Call on_handler_error_f)
     server (Tcp.Where_to_listen.of_port port) server_fun
 
-let main span heartbeat _timeout tls uid gid port sc () =
+let main span _timeout tls uid gid port sc () =
   sc_mode := sc ;
   update_client_span := span ;
   let dtcserver ~server ~port =
@@ -1606,7 +1620,7 @@ let main span heartbeat _timeout tls uid gid port sc () =
     Option.iter uid ~f:Core.Unix.setuid ;
     Option.iter gid ~f:Core.Unix.setgid ;
     Deferred.all_unit [
-      loop_log_errors (fun () -> ws ?heartbeat ()) ;
+      loop_log_errors ws ;
       loop_log_errors (fun () -> dtcserver ~server ~port) ;
     ]
   end
@@ -1621,8 +1635,6 @@ let () =
           span Time_ns.Span.sexp_of_t
           ~default:(Time_ns.Span.of_int_sec 30)
           ~doc:"span Span between client updates"
-      and heartbeat =
-        flag "heartbeat" (optional span) ~doc:" WS heartbeat period"
       and timeout =
         flag_optional_with_default_doc "timeout"
           span Time_ns.Span.sexp_of_t
@@ -1650,6 +1662,6 @@ let () =
           match crt, key with
           | Some crt, Some key -> Some (crt, key)
           | _ -> None in
-        main client_span heartbeat timeout tls uid gid port sc ()
+        main client_span timeout tls uid gid port sc ()
     ]
   |> Command.run
