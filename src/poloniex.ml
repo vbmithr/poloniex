@@ -717,24 +717,24 @@ let security_definition_request addr w msg =
   in
   let req = DTC.parse_security_definition_for_symbol_request msg in
   match req.request_id, req.symbol, req.exchange with
-    | Some request_id, Some symbol, Some exchange ->
-      Logs.debug ~src begin fun m ->
-        m "<- [%s] Sec Def Request %ld %s %s"
-          addr request_id symbol exchange
-      end ;
-      if exchange <> my_exchange then reject addr request_id symbol
-      else begin match String.Table.mem tickers symbol with
-        | false -> reject addr request_id symbol
-        | true ->
-          let secdef = secdef_of_symbol ~final:true ~request_id symbol in
-          Logs.debug ~src begin fun m ->
-            m "-> [%s] Sec Def Response %ld %s %s"
-              addr request_id symbol exchange
-          end ;
-          write_message w `security_definition_response
-            DTC.gen_security_definition_response secdef
-      end
-    | _ -> ()
+  | Some request_id, Some symbol, Some exchange ->
+    Logs.debug ~src begin fun m ->
+      m "<- [%s] Sec Def Request %ld %s %s"
+        addr request_id symbol exchange
+    end ;
+    if exchange <> my_exchange then reject addr request_id symbol
+    else begin match String.Table.mem tickers symbol with
+      | false -> reject addr request_id symbol
+      | true ->
+        let secdef = secdef_of_symbol ~final:true ~request_id symbol in
+        Logs.debug ~src begin fun m ->
+          m "-> [%s] Sec Def Response %ld %s %s"
+            addr request_id symbol exchange
+        end ;
+        write_message w `security_definition_response
+          DTC.gen_security_definition_response secdef
+    end
+  | _ -> ()
 
 let reject_market_data_request ?id addr w k =
   let rej = DTC.default_market_data_reject () in
@@ -1007,9 +1007,9 @@ let current_positions_request addr w msg =
   end
 
 let send_no_order_fills
-  w
-  (req : DTC.Historical_order_fills_request.t)
-  (resp : DTC.Historical_order_fill_response.t) =
+    w
+    (req : DTC.Historical_order_fills_request.t)
+    (resp : DTC.Historical_order_fill_response.t) =
   resp.request_id <- req.request_id ;
   resp.no_order_fills <- Some true ;
   resp.total_number_messages <- Some 1l ;
@@ -1072,7 +1072,7 @@ let historical_order_fills addr w msg =
             match snd a, (Rest.TradeHistory.Set.find data ~f:(fun { gid ; _ } -> gid = srv_ord_id)) with
             | _, Some t -> symbol, Some t
             | _ -> a
-        end
+          end
         with
         | _, None ->
           send_no_order_fills w req resp
@@ -1348,44 +1348,44 @@ let submit_new_single_order_of_open_order symbol (order : Rest.OpenOrder.t) =
 let cancel_order addr msg =
   let { Connection.w ; key ; secret ; client_orders ; orders ; _} =
     Connection.find_exn addr in
-    let req = DTC.parse_cancel_order msg in
-    match Option.map req.server_order_id ~f:Int.of_string with
-    | None ->
-      reject_cancel_order w req "Server order id not set"
-    | Some order_id ->
-      Logs.debug ~src begin fun m ->
-        m "<- [%s] Order Cancel %d" addr order_id
-      end ;
-      RestSync.Default.push_nowait begin fun () ->
-        Rest.cancel_order ~key ~secret ~order_id () >>| function
-        | Error Rest.Http_error.Poloniex msg ->
-          reject_cancel_order w req "%s" msg
-        | Error _ ->
-          reject_cancel_order w req
-            "exception raised while trying to cancel %d" order_id
-        | Ok () ->
-          Logs.debug ~src begin fun m ->
-            m "-> [%s] Order Cancel OK %d" addr order_id
+  let req = DTC.parse_cancel_order msg in
+  match Option.map req.server_order_id ~f:Int.of_string with
+  | None ->
+    reject_cancel_order w req "Server order id not set"
+  | Some order_id ->
+    Logs.debug ~src begin fun m ->
+      m "<- [%s] Order Cancel %d" addr order_id
+    end ;
+    RestSync.Default.push_nowait begin fun () ->
+      Rest.cancel_order ~key ~secret ~order_id () >>| function
+      | Error Rest.Http_error.Poloniex msg ->
+        reject_cancel_order w req "%s" msg
+      | Error _ ->
+        reject_cancel_order w req
+          "exception raised while trying to cancel %d" order_id
+      | Ok () ->
+        Logs.debug ~src begin fun m ->
+          m "-> [%s] Order Cancel OK %d" addr order_id
+        end ;
+        let order_id_str = Int.to_string order_id in
+        match Int.Table.find client_orders order_id,
+              Int.Table.find orders order_id with
+        | None, None ->
+          Logs.err ~src begin fun m ->
+            m "<- [%s] Unable to find order id %d in tables" addr order_id
           end ;
-          let order_id_str = Int.to_string order_id in
-          match Int.Table.find client_orders order_id,
-                Int.Table.find orders order_id with
-          | None, None ->
-            Logs.err ~src begin fun m ->
-              m "<- [%s] Unable to find order id %d in tables" addr order_id
-            end ;
-            send_cancel_update w order_id_str
-              (DTC.default_submit_new_single_order ())
-          | Some client_order, _ ->
-            Int.Table.remove orders order_id ;
-            send_cancel_update w order_id_str client_order ;
-          | None, Some (symbol, order) ->
-            Logs.err ~src begin fun m ->
-              m "[%s] Found open order %d but no matching client order" addr order_id
-            end ;
-            send_cancel_update w order_id_str
-              (submit_new_single_order_of_open_order symbol order)
-      end
+          send_cancel_update w order_id_str
+            (DTC.default_submit_new_single_order ())
+        | Some client_order, _ ->
+          Int.Table.remove orders order_id ;
+          send_cancel_update w order_id_str client_order ;
+        | None, Some (symbol, order) ->
+          Logs.err ~src begin fun m ->
+            m "[%s] Found open order %d but no matching client order" addr order_id
+          end ;
+          send_cancel_update w order_id_str
+            (submit_new_single_order_of_open_order symbol order)
+    end
 
 let reject_cancel_replace_order addr w (req : DTC.cancel_replace_order) k =
   let price1 =
@@ -1604,16 +1604,16 @@ let main span _timeout tls uid gid port sc () =
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
-    | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
-    | Ok currs ->
-      List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
+      | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
+      | Ok currs ->
+        List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
     end >>= fun () ->
     Rest.tickers () >>| begin function
-    | Error err -> failwithf "tickers: %s" (Rest.Http_error.to_string err) ()
-    | Ok ts ->
-      List.iter ts ~f:begin fun (key, t) ->
-        String.Table.set tickers ~key ~data:(now, t)
-      end
+      | Error err -> failwithf "tickers: %s" (Rest.Http_error.to_string err) ()
+      | Ok ts ->
+        List.iter ts ~f:begin fun (key, t) ->
+          String.Table.set tickers ~key ~data:(now, t)
+        end
     end >>= fun () ->
     RestSync.Default.run () ;
     conduit_server ?tls () >>= fun server ->
