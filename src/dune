@@ -1,12 +1,13 @@
 (executable
  (name poloniex)
  (public_name poloniex)
- (modules poloniex)
+ (modules poloniex poloniex_global poloniex_util connection restsync)
  (package poloniex)
  (preprocess (pps ppx_let ppx_sexp_conv))
  (libraries
   core
   async
+  actor
   logs-async
   logs-async-reporter
   logs-async-ovh

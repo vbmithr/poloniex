@@ -3,6 +3,8 @@ open Async
 
 open Plnx
 open Bmex_common
+open Poloniex_global
+open Poloniex_util
 
 module Rest = Plnx_rest
 module Ws = Plnx_ws
@@ -10,76 +12,11 @@ module Ws = Plnx_ws
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
-let src =
-  Logs.Src.create "poloniex" ~doc:"Poloniex DTC"
-
-let loop_log_errors f =
-  let rec inner () =
-    Monitor.try_with_or_error ~name:"loop_log_errors" f >>= function
-    | Ok _ -> assert false
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "run: %a" Error.pp err
-      end >>= fun () ->
-      inner ()
-  in inner ()
-
-let conduit_server ?tls () =
-  match tls with
-  | None -> return `TCP
-  | Some (crt, key) ->
-    Sys.file_exists crt >>= fun crt_exists ->
-    Sys.file_exists key >>| fun key_exists ->
-    match crt_exists, key_exists with
-    | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt, `Key_file_path key)
-    | _ -> failwith "TLS crt/key file not found"
-
-let my_exchange = "PLNX"
-let exchange_account = "exchange"
-let margin_account = "margin"
-let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
-let sc_mode = ref false
-
-let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
-
-let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
-let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
-
-module Book = struct
-  type t = {
-    mutable ts : Time_ns.t ;
-    mutable book : Float.t Float.Map.t
-  }
-
-  let empty = {
-    ts = Time_ns.epoch ;
-    book = Float.Map.empty ;
-  }
-
-  let bids : t String.Table.t = String.Table.create ()
-  let asks : t String.Table.t = String.Table.create ()
-
-  let get_bids = String.Table.find_or_add bids ~default:(fun () -> empty)
-  let get_asks = String.Table.find_or_add asks ~default:(fun () -> empty)
-
-  let set_bids ~symbol ~ts ~book =
-    String.Table.set bids ~key:symbol ~data:{ ts ; book }
-  let set_asks ~symbol ~ts ~book =
-    String.Table.set asks ~key:symbol ~data:{ ts ; book }
-end
-
-let latest_trades : Trade.t String.Table.t = String.Table.create ()
-let session_high : Float.t String.Table.t = String.Table.create ()
-let session_low : Float.t String.Table.t = String.Table.create ()
-let session_volume : Float.t String.Table.t = String.Table.create ()
-
 let _ = Clock_ns.every Time_ns.Span.day begin fun () ->
     String.Table.clear session_high ;
     String.Table.clear session_low ;
     String.Table.clear session_volume
   end
-
-let buf_json = Bi_outbuf.create 4096
 
 let failure_of_error e =
   match Error.to_exn e |> Monitor.extract_exn with
@@ -116,311 +53,7 @@ let secdef_of_symbol ?request_id ?(final=true) symbol =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
-module RestSync : sig
-  type t
-
-  val create : unit -> t
-
-  val push : t -> (unit -> unit Deferred.t) -> unit Deferred.t
-  val push_nowait : t -> (unit -> unit Deferred.t) -> unit
-
-  val run : t -> unit
-
-  val start : t -> unit
-  val stop : t -> unit
-
-  val is_running : t -> bool
-
-  module Default : sig
-    val push : (unit -> unit Deferred.t) -> unit Deferred.t
-    val push_nowait : (unit -> unit Deferred.t) -> unit
-    val run : unit -> unit
-    val start : unit -> unit
-    val stop : unit -> unit
-    val is_running : unit -> bool
-  end
-end = struct
-  type t = {
-    r : (unit -> unit Deferred.t) Pipe.Reader.t ;
-    w : (unit -> unit Deferred.t) Pipe.Writer.t ;
-    mutable run : bool ;
-    condition : unit Condition.t ;
-  }
-
-  let create () =
-    let r, w = Pipe.create () in
-    let condition = Condition.create () in
-    { r ; w ; run = true ; condition }
-
-  let push { w ; _ } thunk =
-    Pipe.write w thunk
-
-  let push_nowait { w ; _ } thunk =
-    Pipe.write_without_pushback w thunk
-
-  let run { r ; run ; condition ; _ } =
-    let rec inner () =
-      if run then
-        Pipe.read r >>= function
-        | `Eof -> Deferred.unit
-        | `Ok thunk ->
-          thunk () >>=
-          inner
-      else
-        Condition.wait condition >>=
-        inner
-    in
-    don't_wait_for (inner ())
-
-  let start t =
-    t.run <- true ;
-    Condition.signal t.condition ()
-
-  let stop t = t.run <- false
-  let is_running { run ; _ } = run
-
-  module Default = struct
-    let default = create ()
-
-    let push thunk = push default thunk
-    let push_nowait thunk = push_nowait default thunk
-
-    let run () = run default
-    let start () = start default
-    let stop () = stop default
-    let is_running () = is_running default
-  end
-end
-
-module Connection = struct
-  type t = {
-    addr: string;
-    w: Writer.t;
-    key: string;
-    secret: string;
-    mutable dropped: int;
-    subs: Int32.t String.Table.t;
-    rev_subs : string Int32.Table.t;
-    subs_depth: Int32.t String.Table.t;
-    rev_subs_depth : string Int32.Table.t;
-    (* Balances *)
-    b_exchange: Rest.Balance.t String.Table.t;
-    b_margin: Float.t String.Table.t;
-    mutable margin: Rest.MarginAccountSummary.t;
-    (* Orders & Trades *)
-    client_orders : DTC.Submit_new_single_order.t Int.Table.t ;
-    orders: (string * Rest.OpenOrder.t) Int.Table.t;
-    trades: Rest.TradeHistory.Set.t String.Table.t;
-    positions: Rest.MarginPosition.t String.Table.t;
-    send_secdefs : bool ;
-  }
-
-  let active : t String.Table.t = String.Table.create ()
-
-  let find = String.Table.find active
-  let find_exn = String.Table.find_exn active
-  let set = String.Table.set active
-  let remove = String.Table.remove active
-
-  let iter = String.Table.iter active
-
-  let write_position_update ?(price=0.) ?(qty=0.) w symbol =
-    let update = DTC.default_position_update () in
-    update.trade_account <- Some margin_account ;
-    update.total_number_messages <- Some 1l ;
-    update.message_number <- Some 1l ;
-    update.symbol <- Some symbol ;
-    update.exchange <- Some my_exchange ;
-    update.quantity <- Some qty ;
-    update.average_price <- Some price ;
-    update.unsolicited <- Some true ;
-    write_message w `position_update DTC.gen_position_update update
-
-  let update_positions { addr; w; key; secret; positions ; _ } =
-    Rest.margin_positions ~buf:buf_json ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "update positions (%s): %a"
-          addr Rest.Http_error.pp err
-      end
-    | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
-        match p with
-        | None ->
-          String.Table.remove positions symbol ;
-          write_position_update w symbol
-        | Some ({ price; qty; _ } as p) ->
-          String.Table.set positions ~key:symbol ~data:p ;
-          write_position_update w symbol ~price ~qty:(qty *. 1e4)
-      end ;
-      Deferred.unit
-
-  let update_orders { addr ; key; secret; orders ; _ } =
-    Rest.open_orders ~buf:buf_json ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "update orders (%s): %a" addr Rest.Http_error.pp err
-      end
-    | Ok os ->
-      Int.Table.clear orders;
-      List.iter os ~f:begin fun (symbol, os) ->
-        List.iter os ~f:begin fun o ->
-          Logs.debug ~src begin fun m ->
-            m "<- [%s] Add %d in order table" addr o.id
-          end ;
-          Int.Table.set orders ~key:o.id ~data:(symbol, o)
-        end
-      end ;
-      Deferred.unit
-
-  let update_trades { addr; key; secret; trades ; _ } =
-    Rest.trade_history ~buf:buf_json ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "update trades (%s): %a" addr Rest.Http_error.pp err
-      end
-    | Ok ts ->
-      List.iter ts ~f:begin fun (symbol, ts) ->
-        let old_ts =
-          String.Table.find trades symbol |>
-          Option.value ~default:Rest.TradeHistory.Set.empty in
-        let cur_ts = Rest.TradeHistory.Set.of_list ts in
-        let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
-        String.Table.set trades ~key:symbol ~data:cur_ts;
-        Rest.TradeHistory.Set.iter new_ts ~f:ignore (* TODO: send order update messages *)
-      end ;
-      Deferred.unit
-
-  let write_margin_balance
-      ?request_id
-      ?(nb_msgs=1)
-      ?(msg_number=1) { addr; w; margin ; _ } =
-    let securities_value = margin.net_value *. 1e3 in
-    let balance = DTC.default_account_balance_update () in
-    balance.request_id <- request_id ;
-    balance.cash_balance <- Some (margin.total_value *. 1e3) ;
-    balance.securities_value <- Some securities_value ;
-    balance.margin_requirement <- Some (margin.total_borrowed_value *. 1e3 *. 0.2) ;
-    balance.balance_available_for_new_positions <-
-      Some (securities_value /. 0.4 -. margin.total_borrowed_value *. 1e3) ;
-    balance.account_currency <- Some "mBTC" ;
-    balance.total_number_messages <- Int32.of_int nb_msgs ;
-    balance.message_number <- Int32.of_int msg_number ;
-    balance.trade_account <- Some margin_account ;
-    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
-    Logs.debug ~src begin fun m ->
-      m "-> %s AccountBalanceUpdate %s (%d/%d)"
-        addr margin_account msg_number nb_msgs
-    end
-
-  let write_exchange_balance
-      ?request_id
-      ?(nb_msgs=1)
-      ?(msg_number=1) { addr; w; b_exchange ; _ } =
-    let b = String.Table.find b_exchange "BTC" |>
-            Option.map ~f:begin fun { Rest.Balance.available; on_orders ; _ } ->
-              available *. 1e3, (available -. on_orders) *. 1e3
-            end
-    in
-    let securities_value =
-      String.Table.fold b_exchange ~init:0.
-        ~f:begin fun ~key:_ ~data:{ Rest.Balance.btc_value ; _ } a ->
-          a +. btc_value end *. 1e3 in
-    let balance = DTC.default_account_balance_update () in
-    balance.request_id <- request_id ;
-    balance.cash_balance <- Option.map b ~f:fst ;
-    balance.securities_value <- Some securities_value ;
-    balance.margin_requirement <- Some 0. ;
-    balance.balance_available_for_new_positions <- Option.map b ~f:snd ;
-    balance.account_currency <- Some "mBTC" ;
-    balance.total_number_messages <- Int32.of_int nb_msgs ;
-    balance.message_number <- Int32.of_int msg_number ;
-    balance.trade_account <- Some exchange_account ;
-    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
-    Logs.debug ~src begin fun m ->
-      m "-> %s AccountBalanceUpdate %s (%d/%d)"
-        addr exchange_account msg_number nb_msgs
-    end
-
-  let update_margin ({ key ; secret ; _ } as conn) =
-    Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src (fun m -> m "%a" Rest.Http_error.pp err)
-    | Ok m ->
-      conn.margin <- m ;
-      Deferred.unit
-
-  let update_positive_balances ({ key ; secret ; b_margin ; _ } as conn) =
-    Rest.positive_balances ~buf:buf_json ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "%a" Rest.Http_error.pp err
-      end
-    | Ok bs ->
-      String.Table.clear b_margin;
-      List.Assoc.find ~equal:(=) bs Margin |>
-      Option.iter ~f:begin
-        List.iter ~f:(fun (c, b) -> String.Table.add_exn b_margin ~key:c ~data:b)
-      end ;
-      write_margin_balance conn ;
-      Deferred.unit
-
-  let update_balances ({ key ; secret ; b_exchange ; _ } as conn) =
-    Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>= function
-    | Error err ->
-      Logs_async.err ~src begin fun m ->
-        m "%a" Rest.Http_error.pp err
-      end
-    | Ok bs ->
-      String.Table.clear b_exchange;
-      List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange ~key:c ~data:b) ;
-      write_exchange_balance conn ;
-      Deferred.unit
-
-  let update_connection conn span =
-    Clock_ns.every
-      ~stop:(Writer.close_started conn.w)
-      ~continue_on_error:true
-      span
-      begin fun () ->
-        let open RestSync.Default in
-        push_nowait (fun () -> update_positions conn) ;
-        push_nowait (fun () -> update_orders conn) ;
-        push_nowait (fun () -> update_trades conn) ;
-        push_nowait (fun () -> update_margin conn) ;
-        push_nowait (fun () -> update_positive_balances conn) ;
-        push_nowait (fun () -> update_balances conn) ;
-      end
-
-  let setup ~addr ~w ~key ~secret ~send_secdefs =
-    let conn = {
-      addr ;
-      w ;
-      key ;
-      secret ;
-      send_secdefs ;
-      dropped = 0 ;
-      subs = String.Table.create () ;
-      rev_subs = Int32.Table.create () ;
-      subs_depth = String.Table.create () ;
-      rev_subs_depth = Int32.Table.create () ;
-      b_exchange = String.Table.create () ;
-      b_margin = String.Table.create () ;
-      margin = Rest.MarginAccountSummary.empty ;
-      client_orders = Int.Table.create () ;
-      orders = Int.Table.create () ;
-      trades = String.Table.create () ;
-      positions = String.Table.create () ;
-    } in
-    set ~key:addr ~data:conn ;
-    if key = "" || secret = "" then Deferred.return false
-    else begin
-      Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
-      | Error _ -> false
-      | Ok _ ->
-        update_connection conn !update_client_span ;
-        true
-    end
-end
+module RestSync = Restsync
 
 let float_of_time ts = Int63.to_float (Time_ns.to_int63_ns_since_epoch ts) /. 1e9
 let int63_of_time ts = Int63.(Time_ns.to_int63_ns_since_epoch ts / of_int 1_000_000_000)
@@ -463,7 +96,7 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
     | None -> t.qty
     | Some qty -> qty +. t.qty
   end ;
-  Logs.debug ~src begin fun m ->
+  Log.debug begin fun m ->
     m "<- %s %a" pair Sexp.pp_hum (Trade.sexp_of_t t)
   end ;
   (* Send trade updates to subscribers. *)
@@ -491,7 +124,7 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
     in
     Option.iter String.Table.(find subs pair) ~f:on_symbol_id
   in
-  String.Table.iter Connection.active ~f:on_connection
+  Connection.iter ~f:on_connection
 
 let send_depth_update
     (update : DTC.Market_depth_update_level.t)
@@ -552,17 +185,17 @@ let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
   let on_connection { Connection.addr; w; subs; subs_depth ; _ } =
     let update_depth symbol_id =
       depth_update.symbol_id <- Some symbol_id ;
-      Logs.debug ~src begin fun m ->
-        m "-> [%s] %s D %a"
-          addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
+      Log.debug begin fun m ->
+        m "-> [%a] %s D %a"
+          pp_print_addr addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
       end ;
       send_depth_update depth_update w u
     in
     let update_bidask symbol_id (bid, ask) =
       bidask_update.symbol_id <- Some symbol_id ;
-      Logs.debug ~src begin fun m ->
-        m "-> [%s] %s BIDASK %a"
-          addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
+      Log.debug begin fun m ->
+        m "-> [%a] %s BIDASK %a"
+          pp_print_addr addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
       end ;
       send_bidask_update bidask_update w bid ask
     in
@@ -571,53 +204,140 @@ let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
     | Some symbol_id, _ -> Option.iter new_best_bidask ~f:(update_bidask symbol_id)
     | _ -> ()
   in
-  String.Table.iter Connection.active ~f:on_connection
+  Connection.iter ~f:on_connection
 
-let on_event subid now = function
-  | Ws.Snapshot { symbol ; bid ; ask } ->
-    Int.Table.set subid_to_sym ~key:subid ~data:symbol ;
-    Book.set_bids ~symbol ~ts:now ~book:bid ;
-    Book.set_asks ~symbol ~ts:now ~book:ask ;
-  | BookEntry entry ->
-    let symbol = Int.Table.find_exn subid_to_sym subid in
-    on_book_update symbol now entry
-  | Trade t ->
-    let symbol = Int.Table.find_exn subid_to_sym subid in
-    on_trade_update symbol t
-  | Ticker _ -> ()
+module Actor_ws = struct
+  module N = struct
+    let base = ["ws"]
+    type t = string
+    let pp = Format.pp_print_string
+    let to_string t = Format.asprintf "%a" pp t
+  end
+  module E = struct
+    type evt =
+      | Connect
+      | Watchdog
+      | Close_started
+      | Close_finished
+      | Snapshot of string
+      | Trade of string
+    [@@deriving sexp]
 
-let ws () =
-  let symbols = String.Table.keys tickers in
-  let latest = ref Time_ns.epoch in
-  let timeout = Time_ns.Span.of_int_sec 10 in
-  let timed_out = Mvar.create () in
-  let terminate_on_timeout stop =
-    Clock_ns.every ~stop timeout begin fun () ->
-      let now = Time_ns.now () in
-      let d = Time_ns.diff now !latest in
-      if !latest <> Time_ns.epoch && Time_ns.Span.(d > timeout) then
-        Mvar.set timed_out ()
-    end in
-  let rec inner () =
-    Plnx_ws_async.with_connection begin fun r w ->
+    type t = {
+      ts: Time_ns.t ;
+      evt: evt ;
+    } [@@deriving sexp]
+
+    let warp10_url =
+      Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
+
+    let to_warp10 { evt ; _ } =
+      let labels, value =
+        match evt with
+        | Connect -> [], Warp10.String "connect"
+        | Watchdog -> [], Warp10.String "watchdog"
+        | Close_started -> [], Warp10.String "close_started"
+        | Close_finished -> [], Warp10.String "close_finished"
+        | Snapshot sym -> ["sym", sym], Warp10.String "snapshot"
+        | Trade sym -> ["sym", sym], Warp10.String "sym" in
+      Some (Warp10.create ~name:"poloniex.ws" ~labels value)
+
+    let dummy = { ts = Time_ns.epoch ; evt = Connect }
+    let event ?(ts=Time_ns.now ()) evt = { ts ; evt }
+    let level { evt ; _ } =
+      match evt with
+      | Trade _ -> Logs.Debug
+      | _ -> Logs.Info
+    let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_t v)
+  end
+  module R = struct
+    type 'a t = {
+      ret: 'a ;
+      ts: Time_ns.t ;
+      evt: Plnx_ws.t ;
+    }
+    type view = { ts: Time_ns.t ; evt: Plnx_ws.t } [@@deriving sexp]
+    let view { ts ; evt ; ret = _ } = { ts ; evt }
+    let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_view v)
+  end
+  module V = struct
+    type state_ =
+      { r : Plnx_ws.t Pipe.Reader.t ;
+        w : Plnx_ws.command Pipe.Writer.t ;
+        cleaned_up : unit Deferred.t ;
+      }
+
+    type state = state_ ref
+    type parameters = unit
+    type view = unit
+    let view _ () = ()
+    let pp ppf _ = Format.pp_print_string ppf ""
+  end
+  module A = Actor.Make(N)(E)(R)(V)
+  include A
+
+  module Handlers : HANDLERS
+    with type self = bounded queue t = struct
+    type self = bounded queue t
+
+    let on_request self { R.ts ; evt = { chanid; seqnum = _; events } ; ret } =
+      List.iter events ~f:begin function
+        | Ws.Snapshot { symbol ; bid ; ask } ->
+          log_event_now self (E.event (Snapshot symbol)) ;
+          Int.Table.set subid_to_sym ~key:chanid ~data:symbol ;
+          Book.set_bids ~symbol ~ts ~book:bid ;
+          Book.set_asks ~symbol ~ts ~book:ask ;
+        | BookEntry entry ->
+          let symbol = Int.Table.find_exn subid_to_sym chanid in
+          on_book_update symbol ts entry
+        | Trade t ->
+          let symbol = Int.Table.find_exn subid_to_sym chanid in
+          log_event_now self (E.event (Trade symbol)) ;
+          on_trade_update symbol t
+        | Ticker _ -> ()
+      end ;
+      return ret
+
+    let init_connection self =
+      let symbols = String.Table.keys tickers in
+      Plnx_ws_async.connect () >>= fun (r, w, cleaned_up) ->
+      log_event self (E.event Connect) >>= fun () ->
       List.iter symbols ~f:begin fun symbol ->
         Pipe.write_without_pushback w
           (Ws.Subscribe (`String symbol, None))
       end ;
-      let on_msg { Ws.chanid ; seqnum = _ ; events } =
-        let now = Time_ns.now () in
-        latest := now ;
-        List.iter events ~f:(on_event chanid now) in
-      let th = Pipe.iter_without_pushback r ~f:on_msg in
-      terminate_on_timeout th ;
-      Deferred.all_unit [ Mvar.take timed_out ; th ]
-    end >>= fun () ->
-    Logs_async.err ~src begin fun m ->
-      m "Websocket connection terminated. Restarting after 10s."
-    end >>= fun () ->
-    Clock_ns.after timeout >>= fun () ->
-    inner () in
-  inner ()
+      let push_request evt =
+        let ts = Time_ns.now () in
+        push_request self { ts ; evt ; ret = () } in
+      don't_wait_for (Pipe.iter r ~f:push_request) ;
+      return { V.r ; w ; cleaned_up }
+
+    let on_close self =
+      let { V.r ; w ; cleaned_up } = !(state self) in
+      log_event self (E.event Close_started) >>= fun () ->
+      Pipe.close w ;
+      Pipe.close_read r ;
+      cleaned_up >>= fun () ->
+      log_event self (E.event Close_finished)
+
+    let on_launch self _ _ =
+      init_connection self >>| ref
+
+    let on_no_request self =
+      (* Reinitialize dead connection *)
+      log_event self (E.event Watchdog) >>= fun () ->
+      on_close self >>= fun () ->
+      init_connection self >>= fun st ->
+      (state self) := st ;
+      Deferred.unit
+
+    let on_completion _self _req _arg _status =
+      Deferred.unit
+
+    let on_error _self _view _status _error =
+      Deferred.unit
+  end
+end
 
 let heartbeat addr w ival =
   let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
@@ -627,8 +347,8 @@ let heartbeat addr w ival =
     match Connection.find addr with
     | None -> Deferred.unit
     | Some { Connection.dropped ; _ } ->
-      Logs_async.debug ~src begin fun m ->
-        m "-> [%s] Heartbeat" addr
+      Log_async.debug begin fun m ->
+        m "-> [%a] Heartbeat" pp_print_addr addr
       end >>= fun () ->
       msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
       write_message w `heartbeat DTC.gen_heartbeat msg ;
@@ -637,10 +357,12 @@ let heartbeat addr w ival =
   loop ()
 
 let encoding_request addr w =
-  Logs.debug ~src (fun m -> m "<- [%s] Encoding Request" addr) ;
+  Log.debug
+    (fun m -> m "<- [%a] Encoding Request" pp_print_addr addr) ;
   Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
   Writer.write w ;
-  Logs.debug ~src (fun m -> m "-> [%s] Encoding Response" addr)
+  Log.debug
+    (fun m -> m "-> [%a] Encoding Response" pp_print_addr addr)
 
 let logon_response ~result_text ~trading_supported =
   let resp = DTC.default_logon_response () in
@@ -665,7 +387,8 @@ let logon_request addr w msg =
   let int1 = Option.value ~default:0l req.integer_1 in
   let int2 = Option.value ~default:0l req.integer_2 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
-  Logs.debug ~src (fun m -> m "<- [%s] Logon Request" addr) ;
+  Log.debug
+    (fun m -> m "<- [%a] Logon Request" pp_print_addr addr) ;
   let accept trading =
     let trading_supported, result_text =
       match trading with
@@ -675,13 +398,15 @@ let logon_request addr w msg =
     don't_wait_for @@ heartbeat addr w req.heartbeat_interval_in_seconds;
     write_message w `logon_response
       DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
-    Logs.debug ~src (fun m -> m "-> [%s] Logon Response (%s)" addr result_text) ;
+    Log.debug begin fun m ->
+      m "-> [%a] Logon Response (%s)" pp_print_addr addr result_text
+    end ;
     if not !sc_mode || send_secdefs then begin
       String.Table.iteri tickers ~f:begin fun ~key:symbol ~data:_ ->
         let secdef = secdef_of_symbol ~final:true symbol in
         write_message w `security_definition_response
           DTC.gen_security_definition_response secdef ;
-        Logs.debug ~src (fun m -> m "Written secdef %s" symbol)
+        Log.debug (fun m -> m "Written secdef %s" symbol)
       end
     end
   in
@@ -704,10 +429,10 @@ let heartbeat _addr _msg =
   (* Log.debug log_dtc "<- [%s] Heartbeat" addr *)
   ()
 
-let security_definition_request addr w msg =
-  let reject addr_str request_id symbol =
-    Logs.info ~src begin fun m ->
-      m "-> [%s] (req: %ld) Unknown symbol %s" addr_str request_id symbol
+let security_definition_request log_evt addr w msg =
+  let reject request_id symbol =
+    Log.info begin fun m ->
+      m "-> [%a] (req: %ld) Unknown symbol %s" pp_print_addr addr request_id symbol
     end ;
     let rej = DTC.default_security_definition_reject () in
     rej.request_id <- Some request_id ;
@@ -718,18 +443,19 @@ let security_definition_request addr w msg =
   let req = DTC.parse_security_definition_for_symbol_request msg in
   match req.request_id, req.symbol, req.exchange with
   | Some request_id, Some symbol, Some exchange ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Sec Def Request %ld %s %s"
-        addr request_id symbol exchange
+    log_evt symbol ;
+    Log.debug begin fun m ->
+      m "<- [%a] Sec Def Request %ld %s %s"
+        pp_print_addr addr request_id symbol exchange
     end ;
-    if exchange <> my_exchange then reject addr request_id symbol
+    if exchange <> my_exchange then reject request_id symbol
     else begin match String.Table.mem tickers symbol with
-      | false -> reject addr request_id symbol
+      | false -> reject request_id symbol
       | true ->
         let secdef = secdef_of_symbol ~final:true ~request_id symbol in
-        Logs.debug ~src begin fun m ->
-          m "-> [%s] Sec Def Response %ld %s %s"
-            addr request_id symbol exchange
+        Log.debug begin fun m ->
+          m "-> [%a] Sec Def Response %ld %s %s"
+            pp_print_addr addr request_id symbol exchange
         end ;
         write_message w `security_definition_response
           DTC.gen_security_definition_response secdef
@@ -741,8 +467,8 @@ let reject_market_data_request ?id addr w k =
   rej.symbol_id <- id ;
   Printf.ksprintf begin fun reject_text ->
     rej.reject_text <- Some reject_text ;
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] Market Data Reject: %s" addr reject_text
+    Log.debug begin fun m ->
+      m "-> [%a] Market Data Reject: %s" pp_print_addr addr reject_text
     end ;
     write_message w `market_data_reject DTC.gen_market_data_reject rej
   end k
@@ -775,7 +501,7 @@ let write_market_data_snapshot ?id symbol w =
   end ;
   write_message w `market_data_snapshot DTC.gen_market_data_snapshot snap
 
-let market_data_request addr w msg =
+let market_data_request log_evt addr w msg =
   let req = DTC.parse_market_data_request msg in
   let { Connection.subs ; rev_subs ; _ } = Connection.find_exn addr in
   match req.request_action,
@@ -788,44 +514,31 @@ let market_data_request addr w msg =
   | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
     reject_market_data_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Market Data Unsubscribe %ld" addr id
-    end ;
     Option.iter (Int32.Table.find rev_subs id) ~f:begin fun symbol ->
-      Logs.debug ~src begin fun m ->
-        m "<- [%s] Market Data Unsubscribe %ld %s" addr id symbol
-      end ;
+      log_evt `unsubscribe symbol ;
       String.Table.remove subs symbol
     end ;
     Int32.Table.remove rev_subs id
-  | Some `snapshot, _, Some symbol, Some exchange ->
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
-    end ;
+  | Some `snapshot, _, Some symbol, _ ->
+    log_evt `snapshot symbol ;
     write_market_data_snapshot symbol w
-  | Some `subscribe, Some id, Some symbol, Some exchange ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Market Data Subscribe %ld %s %s"
-        addr id symbol exchange
-    end ;
+  | Some `subscribe, Some id, Some symbol, _ ->
+    log_evt `subscribe symbol ;
     begin
       match Int32.Table.find rev_subs id with
       | Some symbol' when symbol <> symbol' ->
         reject_market_data_request addr w ~id
-          "Already subscribed to %s-%s with a different id (was %ld)"
-          symbol exchange id
+          "Already subscribed to %s with a different id (was %ld)"
+          symbol id
       | _ ->
         String.Table.set subs ~key:symbol ~data:id ;
         Int32.Table.set rev_subs ~key:id ~data:symbol ;
-        write_market_data_snapshot ~id symbol w ;
-        Logs.debug ~src begin fun m ->
-          m "-> [%s] Market Data Snapshot %s %s" addr symbol exchange
-        end
+        write_market_data_snapshot ~id symbol w
     end
   | _ ->
     reject_market_data_request addr w "invalid request"
 
-let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
+let write_market_depth_snapshot ?id addr w ~symbol ~num_levels =
   let bid = Book.get_bids symbol in
   let ask = Book.get_asks symbol in
   let bid_size = Float.Map.length bid.book in
@@ -865,9 +578,10 @@ let write_market_depth_snapshot ?id addr w ~symbol ~exchange ~num_levels =
   snap.is_last_message_in_batch <- Some true ;
   write_message w `market_depth_snapshot_level
     DTC.gen_market_depth_snapshot_level snap ;
-  Logs.debug ~src begin fun m ->
-    m "-> [%s] Market Depth Snapshot %s %s (%d/%d)"
-      addr symbol exchange (Int.min bid_size num_levels) (Int.min ask_size num_levels)
+  Log.debug begin fun m ->
+    m "-> [%a] Market Depth Snapshot %s (%d/%d)"
+      pp_print_addr addr symbol
+      (Int.min bid_size num_levels) (Int.min ask_size num_levels)
   end
 
 let reject_market_depth_request ?id addr w k =
@@ -875,14 +589,15 @@ let reject_market_depth_request ?id addr w k =
   rej.symbol_id <- id ;
   Printf.ksprintf begin fun reject_text ->
     rej.reject_text <- Some reject_text ;
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] Market Depth Reject: %s" addr reject_text
+    Log.debug begin fun m ->
+      m "-> [%a] Market Depth Reject: %s"
+        pp_print_addr addr reject_text
     end ;
     write_message w `market_depth_reject
       DTC.gen_market_depth_reject rej
   end k
 
-let market_depth_request addr w msg =
+let market_depth_request log_evt addr w msg =
   let req = DTC.parse_market_depth_request msg in
   let num_levels = Option.value_map req.num_levels ~default:50 ~f:Int32.to_int_exn in
   let { Connection.subs_depth ; rev_subs_depth ; _ } = Connection.find_exn addr in
@@ -896,30 +611,23 @@ let market_depth_request addr w msg =
   | _, id, Some symbol, _ when not (String.Table.mem tickers symbol) ->
     reject_market_depth_request ?id addr w "No such symbol %s" symbol
   | Some `unsubscribe, Some id, _, _ ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Market Depth Unsubscribe %ld" addr id
-    end ;
     Option.iter (Int32.Table.find rev_subs_depth id) ~f:begin fun symbol ->
-      Logs.debug ~src begin fun m ->
-        m "<- [%s] Market Depth Unsubscribe %ld %s" addr id symbol
-      end ;
+      log_evt `unsubscribe symbol ;
       String.Table.remove subs_depth symbol
     end ;
     Int32.Table.remove rev_subs_depth id
-  | Some `subscribe, Some id, Some symbol, Some exchange ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Market Depth Subscribe %ld %s %s" addr id symbol exchange
-    end ;
+  | Some `subscribe, Some id, Some symbol, _ ->
+    log_evt `subscribe symbol ;
     begin
       match Int32.Table.find rev_subs_depth id with
       | Some symbol' when symbol <> symbol' ->
         reject_market_depth_request addr w ~id
-          "Already subscribed to %s-%s with a different id (was %ld)"
-          symbol exchange id
+          "Already subscribed to %s with a different id (was %ld)"
+          symbol id
       | _ ->
         String.Table.set subs_depth ~key:symbol ~data:id ;
         Int32.Table.set rev_subs_depth ~key:id ~data:symbol ;
-        write_market_depth_snapshot ~id addr w ~symbol ~exchange ~num_levels
+        write_market_depth_snapshot ~id addr w ~symbol ~num_levels
     end
   | _ ->
     reject_market_depth_request addr w "invalid request"
@@ -952,8 +660,8 @@ let open_orders_request addr w msg =
   match req.request_id with
   | Some request_id ->
     let { Connection.orders ; _ } = Connection.find_exn addr in
-    Logs.debug begin fun m ->
-      m "<- [%s] Open Orders Request" addr
+    Log.debug begin fun m ->
+      m "<- [%a] Open Orders Request" pp_print_addr addr
     end ;
     let nb_open_orders = Int.Table.length orders in
     let (_:Int32.t) = Int.Table.fold orders
@@ -967,15 +675,15 @@ let open_orders_request addr w msg =
       resp.no_orders <- Some true ;
       write_message w `order_update DTC.gen_order_update resp
     end;
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] %d order(s)" addr nb_open_orders
+    Log.debug begin fun m ->
+      m "-> [%a] %d order(s)" pp_print_addr addr nb_open_orders
     end
   | _ -> ()
 
 let current_positions_request addr w msg =
   let { Connection.positions ; _ } = Connection.find_exn addr in
-  Logs.debug ~src begin fun m ->
-    m "<- [%s] Positions" addr
+  Log.debug begin fun m ->
+    m "<- [%a] Positions" pp_print_addr addr
   end ;
   let nb_msgs = String.Table.length positions in
   let req = DTC.parse_current_positions_request msg in
@@ -1002,8 +710,8 @@ let current_positions_request addr w msg =
     update.no_positions <- Some true ;
     write_message w `position_update DTC.gen_position_update update
   end ;
-  Logs.debug ~src begin fun m ->
-    m "-> [%s] %d position(s)" addr nb_msgs
+  Log.debug begin fun m ->
+    m "-> [%a] %d position(s)" pp_print_addr addr nb_msgs
   end
 
 let send_no_order_fills
@@ -1047,8 +755,8 @@ let historical_order_fills addr w msg =
     Option.value_map req.number_of_days ~default:Time_ns.epoch ~f:begin fun n ->
       Time_ns.(sub (now ()) (Span.of_day (Int32.to_float n)))
     end in
-  Logs.debug ~src begin fun m ->
-    m "<- [%s] Historical Order Fills Req" addr
+  Log.debug begin fun m ->
+    m "<- [%a] Historical Order Fills Req" pp_print_addr addr
   end ;
   let nb_trades = String.Table.fold trades ~init:0 ~f:begin fun ~key:_ ~data a ->
       Rest.TradeHistory.Set.fold data ~init:a ~f:begin fun a t ->
@@ -1084,8 +792,8 @@ let historical_order_fills addr w msg =
 let trade_account_request addr w msg =
   let req = DTC.parse_trade_accounts_request msg in
   let resp = DTC.default_trade_account_response () in
-  Logs.debug ~src begin fun m ->
-    m "<- [%s] TradeAccountsRequest" addr
+  Log.debug begin fun m ->
+    m "<- [%a] TradeAccountsRequest" pp_print_addr addr
   end ;
   let accounts = [exchange_account; margin_account] in
   let nb_msgs = List.length accounts in
@@ -1096,9 +804,9 @@ let trade_account_request addr w msg =
     resp.message_number <- Some msg_number ;
     resp.trade_account <- Some trade_account ;
     write_message w `trade_account_response DTC.gen_trade_account_response resp ;
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] TradeAccountResponse: %s (%ld/%d)"
-        addr trade_account msg_number nb_msgs
+    Log.debug begin fun m ->
+      m "-> [%a] TradeAccountResponse: %s (%ld/%d)"
+        pp_print_addr addr trade_account msg_number nb_msgs
     end
   end
 
@@ -1106,8 +814,9 @@ let reject_account_balance_request addr request_id account =
   let rej = DTC.default_account_balance_reject () in
   rej.request_id <- request_id ;
   rej.reject_text <- Some ("Unknown account " ^ account) ;
-  Logs.debug ~src begin fun m ->
-    m "-> [%s] AccountBalanceReject: unknown account %s" addr account
+  Log.debug begin fun m ->
+    m "-> [%a] AccountBalanceReject: unknown account %s"
+      pp_print_addr addr account
   end
 
 let account_balance_request addr msg =
@@ -1116,19 +825,19 @@ let account_balance_request addr msg =
   match req.trade_account with
   | None
   | Some "" ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] AccountBalanceRequest (all accounts)" c.addr
+    Log.debug begin fun m ->
+      m "<- [%a] AccountBalanceRequest (all accounts)" pp_print_addr c.addr
     end ;
     Connection.write_exchange_balance ?request_id:req.request_id ~msg_number:1 ~nb_msgs:2 c;
     Connection.write_margin_balance ?request_id:req.request_id ~msg_number:2 ~nb_msgs:2 c
   | Some account when account = exchange_account ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] AccountBalanceRequest (%s)" c.addr account
+    Log.debug begin fun m ->
+      m "<- [%a] AccountBalanceRequest (%s)" pp_print_addr c.addr account
     end ;
     Connection.write_exchange_balance ?request_id:req.request_id c
   | Some account when account = margin_account ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] AccountBalanceRequest (%s)" c.addr account
+    Log.debug begin fun m ->
+      m "<- [%a] AccountBalanceRequest (%s)" pp_print_addr c.addr account
     end ;
     Connection.write_margin_balance ?request_id:req.request_id c
   | Some account ->
@@ -1202,8 +911,9 @@ let submit_new_order
     if margin then Rest.submit_margin_order ?max_lending_rate:None
     else Rest.submit_order
   in
-  Logs.debug ~src begin fun m ->
-    m "-> [%s] Submit Order %s %f %f" addr symbol price qty
+  Log.debug begin fun m ->
+    m "-> [%a] Submit Order %s %f %f"
+      pp_print_addr addr symbol price qty
   end ;
   order_f ~buf:buf_json ?tif ~key ~secret ~side ~symbol ~price ~qty () >>| function
   | Error Rest.Http_error.Poloniex msg ->
@@ -1216,8 +926,8 @@ let submit_new_order
       Int.Table.set client_orders ~key:id ~data:req ;
       Int.Table.set orders ~key:id
         ~data:(symbol, open_order_of_submit_new_single_order id req margin) ;
-      Logs.debug ~src begin fun m ->
-        m "<- [%s] Submit Order OK %d" addr id
+      Log.debug begin fun m ->
+        m "<- [%a] Submit Order OK %d" pp_print_addr addr id
       end ;
       match trades, amount_unfilled with
       | [], _ ->
@@ -1299,12 +1009,12 @@ let submit_new_single_order
 let submit_new_single_order addr msg =
   let conn = Connection.find_exn addr in
   let req = DTC.parse_submit_new_single_order msg in
-  Logs.debug ~src begin fun m ->
-    m "<- [%s] Submit New Single Order" conn.addr
+  Log.debug begin fun m ->
+    m "<- [%a] Submit New Single Order" pp_print_addr conn.addr
   end ;
   try submit_new_single_order conn req with
   | Exit -> ()
-  | exn -> Logs.err ~src (fun m -> m "%a" Exn.pp exn)
+  | exn -> Log.err (fun m -> m "%a" Exn.pp exn)
 
 let reject_cancel_order w (req : DTC.cancel_order) k =
   let update = DTC.default_order_update () in
@@ -1353,8 +1063,8 @@ let cancel_order addr msg =
   | None ->
     reject_cancel_order w req "Server order id not set"
   | Some order_id ->
-    Logs.debug ~src begin fun m ->
-      m "<- [%s] Order Cancel %d" addr order_id
+    Log.debug begin fun m ->
+      m "<- [%a] Order Cancel %d" pp_print_addr addr order_id
     end ;
     RestSync.Default.push_nowait begin fun () ->
       Rest.cancel_order ~key ~secret ~order_id () >>| function
@@ -1364,15 +1074,16 @@ let cancel_order addr msg =
         reject_cancel_order w req
           "exception raised while trying to cancel %d" order_id
       | Ok () ->
-        Logs.debug ~src begin fun m ->
-          m "-> [%s] Order Cancel OK %d" addr order_id
+        Log.debug begin fun m ->
+          m "-> [%a] Order Cancel OK %d" pp_print_addr addr order_id
         end ;
         let order_id_str = Int.to_string order_id in
         match Int.Table.find client_orders order_id,
               Int.Table.find orders order_id with
         | None, None ->
-          Logs.err ~src begin fun m ->
-            m "<- [%s] Unable to find order id %d in tables" addr order_id
+          Log.err begin fun m ->
+            m "<- [%a] Unable to find order id %d in tables"
+              pp_print_addr addr order_id
           end ;
           send_cancel_update w order_id_str
             (DTC.default_submit_new_single_order ())
@@ -1380,8 +1091,9 @@ let cancel_order addr msg =
           Int.Table.remove orders order_id ;
           send_cancel_update w order_id_str client_order ;
         | None, Some (symbol, order) ->
-          Logs.err ~src begin fun m ->
-            m "[%s] Found open order %d but no matching client order" addr order_id
+          Log.err begin fun m ->
+            m "[%a] Found open order %d but no matching client order"
+              pp_print_addr addr order_id
           end ;
           send_cancel_update w order_id_str
             (submit_new_single_order_of_open_order symbol order)
@@ -1406,8 +1118,8 @@ let reject_cancel_replace_order addr w (req : DTC.cancel_replace_order) k =
   update.time_in_force <- req.time_in_force ;
   update.good_till_date_time <- req.good_till_date_time ;
   Printf.ksprintf begin fun info_text ->
-    Logs.debug ~src begin fun m ->
-      m "-> [%s] Cancel Replace Reject: %s" addr info_text
+    Log.debug begin fun m ->
+      m "-> [%a] Cancel Replace Reject: %s" pp_print_addr addr info_text
     end ;
     update.info_text <- Some info_text ;
     write_message w `order_update DTC.gen_order_update update
@@ -1449,8 +1161,8 @@ let cancel_replace_order addr msg =
   let { Connection.addr ; w ; key ; secret ; client_orders ; orders ; _ }
     = Connection.find_exn addr in
   let req = DTC.parse_cancel_replace_order msg in
-  Logs.debug ~src begin fun m ->
-    m "<- [%s] Cancel Replace Order" addr
+  Log.debug begin fun m ->
+    m "<- [%a] Cancel Replace Order" pp_print_addr addr
   end ;
   let order_type = Option.value ~default:`order_type_unset req.order_type in
   let tif = Option.value ~default:`tif_unset req.time_in_force in
@@ -1478,16 +1190,18 @@ let cancel_replace_order addr msg =
           reject_cancel_replace_order addr w req
             "cancel order %d failed" orig_server_id
         | Ok { id; trades = _ ; amount_unfilled } ->
-          Logs.debug ~src begin fun m ->
-            m "<- [%s] Cancel Replace Order %d -> %d OK" addr orig_server_id id
+          Log.debug begin fun m ->
+            m "<- [%a] Cancel Replace Order %d -> %d OK"
+              pp_print_addr addr orig_server_id id
           end ;
           let order_id_str = Int.to_string id in
           let amount_unfilled = amount_unfilled *. 1e4 in
           match Int.Table.find client_orders orig_server_id,
                 Int.Table.find orders orig_server_id with
           | None, None ->
-            Logs.err ~src begin fun m ->
-              m "[%s] Unable to find order id %d in tables" addr orig_server_id
+            Log.err begin fun m ->
+              m "[%a] Unable to find order id %d in tables"
+                pp_print_addr addr orig_server_id
             end ;
             send_cancel_replace_update w order_id_str amount_unfilled
               (DTC.default_submit_new_single_order ()) req
@@ -1499,26 +1213,118 @@ let cancel_replace_order addr msg =
             send_cancel_replace_update
               w order_id_str amount_unfilled client_order req
           | Some client_order, None ->
-            Logs.err ~src begin fun m ->
-              m "[%s] Found client order %d but no matching open order"
-                addr orig_server_id
+            Log.err begin fun m ->
+              m "[%a] Found client order %d but no matching open order"
+                pp_print_addr addr orig_server_id
             end ;
             Int.Table.remove client_orders orig_server_id ;
             Int.Table.set client_orders ~key:id ~data:client_order ;
             send_cancel_replace_update
               w order_id_str amount_unfilled client_order req
           | None, Some (symbol, order) ->
-            Logs.err ~src begin fun m ->
-              m "[%s] Found open order %d but no matching client order"
-                addr orig_server_id
+            Log.err begin fun m ->
+              m "[%a] Found open order %d but no matching client order"
+                pp_print_addr addr orig_server_id
             end ;
             send_cancel_replace_update w order_id_str amount_unfilled
               (submit_new_single_order_of_open_order symbol order) req
       end
 
-let dtcserver ~server ~port =
-  let server_fun addr r w =
-    let addr = Socket.Address.Inet.to_string addr in
+module Actor_dtc = struct
+  module N = struct
+    let base = ["dtc"]
+    type t = string
+    let pp = Format.pp_print_string
+    let to_string t = Format.asprintf "%a" pp t
+  end
+  module E = struct
+    type evt =
+      | TCP_handler_error of Exn.t
+      | Connection_io_error of Exn.t
+
+      | Connect
+      | Disconnect
+
+      | Encoding_request
+      | Logon_request
+      | Heartbeat
+      | SecurityDefinitionForSymbolRequest of string
+      | MarketDataRequest of { action : [`subscribe | `unsubscribe | `snapshot] ;
+                               sym : string }
+      | MarketDepthRequest of { action : [`subscribe | `unsubscribe | `snapshot] ;
+                                sym : string }
+    [@@deriving sexp_of]
+
+    type t = {
+      ts: Time_ns.t ;
+      src: Socket.Address.Inet.t ;
+      evt: evt ;
+    } [@@deriving sexp_of]
+
+    let warp10_url =
+      Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
+
+    let to_warp10 { src ; evt ; _ } =
+      let labels, value =
+        match evt with
+        | TCP_handler_error exn ->
+          ["exn", Exn.to_string exn], Warp10.String "tcp_error"
+        | Connection_io_error exn ->
+          ["exn", Exn.to_string exn], Warp10.String "io_error"
+
+        | Connect -> [], Warp10.String "connect"
+        | Disconnect -> [], Warp10.String "disconnect"
+        | Encoding_request -> [], Warp10.String "encoding"
+        | Logon_request -> [], Warp10.String "logon"
+        | Heartbeat -> [], Warp10.String "heartbeat"
+        | SecurityDefinitionForSymbolRequest sym ->
+          ["sym", sym], Warp10.String "secdef"
+        | MarketDataRequest { sym ; _ } ->
+          ["sym", sym], Warp10.String "data"
+        | MarketDepthRequest { sym ; _ } ->
+          ["sym", sym], Warp10.String "depth" in
+
+      let labels =
+        ("src", Socket.Address.Inet.to_string src) :: labels in
+      Some (Warp10.create ~name:"poloniex.dtc" ~labels value)
+
+    let create ?(ts=Time_ns.now ()) src evt = { ts ; src ; evt }
+    let dummy = create
+        (Socket.Address.Inet.create Unix.Inet_addr.localhost ~port:0) Connect
+    let level { evt ; _ } =
+      match evt with
+      | TCP_handler_error _
+      | Connection_io_error _ -> Logs.Error
+      | _ -> Info
+    let pp ppf v= Sexplib.Sexp.pp ppf (sexp_of_t v)
+  end
+  module R = struct
+    type 'a t = {
+      ret: 'a ;
+    }
+    type view = unit [@@deriving sexp]
+    let view { ret = _ } = ()
+    let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_view v)
+  end
+  module V = struct
+    type state_ = (Socket.Address.Inet.t, int) Tcp.Server.t
+    type state = state_ ref
+    type parameters = {
+      server : Conduit_async.server ;
+      port : int
+    }
+    type view = unit
+    let view _ _ = ()
+    let pp ppf _ = Format.pp_print_string ppf ""
+  end
+  module A = Actor.Make(N)(E)(R)(V)
+  include A
+
+  let server_fun self addr r w =
+    let on_connection_io_error exn =
+      log_event_now self (E.create addr (Connection_io_error exn)) ;
+      Connection.remove addr
+    in
     (* So that process does not allocate all the time. *)
     let rec handle_chunk consumed buf ~pos ~len =
       if len < 2 then return @@ `Consumed (consumed, `Need_unknown)
@@ -1534,17 +1340,31 @@ let dtcserver ~server ~port =
           let msg = Piqirun.init_from_string msg_str in
           begin match msgtype with
             | `encoding_request ->
+              log_event_now self (E.create addr Logon_request) ;
               begin match (Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
-                | None -> Logs.err ~src begin fun m ->
+                | None -> Log.err begin fun m ->
                     m "Invalid encoding request received"
                   end
                 | Some _ -> encoding_request addr w
               end
-            | `logon_request -> logon_request addr w msg
-            | `heartbeat -> heartbeat addr msg
-            | `security_definition_for_symbol_request -> security_definition_request addr w msg
-            | `market_data_request -> market_data_request addr w msg
-            | `market_depth_request -> market_depth_request addr w msg
+            | `logon_request ->
+              log_event_now self (E.create addr Logon_request) ;
+              logon_request addr w msg
+            | `heartbeat ->
+              log_event_now self (E.create addr Heartbeat) ;
+              heartbeat addr msg
+            | `security_definition_for_symbol_request ->
+              let log_evt sym = log_event_now self
+                  (E.create addr (SecurityDefinitionForSymbolRequest sym)) in
+              security_definition_request log_evt addr w msg
+            | `market_data_request ->
+              let log_evt action sym = log_event_now self
+                  (E.create addr (MarketDataRequest { action ; sym })) in
+              market_data_request log_evt addr w msg
+            | `market_depth_request ->
+              let log_evt action sym = log_event_now self
+                  (E.create addr (MarketDepthRequest { action ; sym })) in
+              market_depth_request log_evt addr w msg
             | `open_orders_request -> open_orders_request addr w msg
             | `current_positions_request -> current_positions_request addr w msg
             | `historical_order_fills_request -> historical_order_fills addr w msg
@@ -1554,49 +1374,69 @@ let dtcserver ~server ~port =
             | `cancel_order -> cancel_order addr msg
             | `cancel_replace_order -> cancel_replace_order addr msg
             | #DTC.dtcmessage_type ->
-              Logs.err ~src begin fun m -> m
+              Log.err begin fun m -> m
                   "Unknown msg type %d" msgtype_int
               end
           end ;
           handle_chunk (consumed + msglen) buf ~pos:(pos + msglen) ~len:(len - msglen)
-        end
-    in
-    let on_connection_io_error exn =
-      Connection.remove addr ;
-      Logs.err ~src begin fun m ->
-        m "on_connection_io_error (%s): %a" addr Exn.pp exn
-      end
-    in
-    let cleanup () =
-      Logs_async.info ~src begin fun m ->
-        m "client %s disconnected" addr
-      end >>= fun () ->
-      Connection.remove addr ;
-      Deferred.all_unit [Writer.close w; Reader.close r]
-    in
-    Deferred.ignore @@ Monitor.protect ~finally:cleanup begin fun () ->
-      Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_connection_io_error;
-      Reader.(read_one_chunk_at_a_time r ~handle_chunk:(handle_chunk 0))
-    end
-  in
-  let on_handler_error_f addr exn =
-    Logs.err ~src begin fun m ->
-      m "on_handler_error (%s): %a"
-        Socket.Address.(to_string addr) Exn.pp exn
-    end
-  in
-  Conduit_async.serve
-    ~on_handler_error:(`Call on_handler_error_f)
-    server (Tcp.Where_to_listen.of_port port) server_fun
+        end in
+    Monitor.detach_and_iter_errors Writer.(monitor w) ~f:on_connection_io_error;
+    log_event self (E.create addr Connect) >>= fun () ->
+    Reader.read_one_chunk_at_a_time r
+      ~handle_chunk:(handle_chunk 0) >>= fun _ ->
+    (* TODO: handle error *)
+    Deferred.unit
 
-let main span _timeout tls uid gid port sc () =
+  module Handlers : HANDLERS
+    with type self = bounded queue t = struct
+
+    type self = bounded queue t
+
+    let on_handler_error self addr exn =
+      log_event_now self (E.create addr (TCP_handler_error exn))
+
+    let on_request _self { R.ret } =
+      return ret
+
+    let on_close _self =
+      Deferred.unit
+
+    let on_launch self _name { V.server ; port } =
+      Conduit_async.serve
+        ~on_handler_error:(`Call (on_handler_error self))
+        server (Tcp.Where_to_listen.of_port port)
+        (server_fun self) >>| fun srv ->
+      ref srv
+
+    let on_no_request _self =
+      Deferred.unit
+
+    let on_completion _self _req _arg _status =
+      Deferred.unit
+
+    let on_error _self _view _status _error =
+      Deferred.unit
+  end
+end
+
+(* let dtcserver ~server ~port =
+ *   in
+ *   let cleanup () =
+ *     Log_async.info begin fun m ->
+ *       m "client %s disconnected" addr
+ *     end >>= fun () ->
+ *     Connection.remove addr ;
+ *     Deferred.all_unit [Writer.close w; Reader.close r]
+ *   in *)
+
+let main span timeout tls uid gid port sc () =
   sc_mode := sc ;
   update_client_span := span ;
-  let dtcserver ~server ~port =
-    dtcserver ~server ~port >>= fun dtc_server ->
-    Logs_async.info ~src (fun m -> m "DTC server started") >>= fun () ->
-    Tcp.Server.close_finished dtc_server
-  in
+  (* let dtcserver ~server ~port =
+   *   dtcserver ~server ~port >>= fun dtc_server ->
+   *   Log_async.info (fun m -> m "DTC server started") >>= fun () ->
+   *   Tcp.Server.close_finished dtc_server
+   * in *)
   stage begin fun `Scheduler_started ->
     let logs =
       Option.Monad_infix.(Sys.getenv "OVH_LOGS_URL" >>| Uri.of_string) in
@@ -1619,10 +1459,15 @@ let main span _timeout tls uid gid port sc () =
     conduit_server ?tls () >>= fun server ->
     Option.iter uid ~f:Core.Unix.setuid ;
     Option.iter gid ~f:Core.Unix.setgid ;
-    Deferred.all_unit [
-      loop_log_errors ws ;
-      loop_log_errors (fun () -> dtcserver ~server ~port) ;
-    ]
+    Actor_ws.launch
+      (Actor_ws.bounded 10) ~timeout
+      (Actor.Types.create_limits ()) "" ()
+      (module Actor_ws.Handlers) >>= fun _ws_worker ->
+    Actor_dtc.launch
+      (Actor_dtc.bounded 10)
+      (Actor.Types.create_limits ()) "" { server ; port }
+      (module Actor_dtc.Handlers) >>= fun _dtc_worker ->
+    Deferred.never ()
   end
 
 let () =
@@ -1638,7 +1483,7 @@ let () =
       and timeout =
         flag_optional_with_default_doc "timeout"
           span Time_ns.Span.sexp_of_t
-          ~default:(Time_ns.Span.of_int_sec 60)
+          ~default:(Time_ns.Span.of_int_sec 10)
           ~doc:"span Max Disconnect if no message received in N seconds"
       and port =
         flag_optional_with_default_doc "port"
