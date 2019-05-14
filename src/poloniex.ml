@@ -228,6 +228,9 @@ module Actor_ws = struct
       evt: evt ;
     } [@@deriving sexp]
 
+    let http_port =
+      Option.map ~f:Int.of_string (Sys.getenv "PLNX_WS_HTTP_PORT")
+
     let warp10_url =
       Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
 
@@ -1260,6 +1263,9 @@ module Actor_dtc = struct
       src: Socket.Address.Inet.t ;
       evt: evt ;
     } [@@deriving sexp_of]
+
+    let http_port =
+      Option.map ~f:Int.of_string (Sys.getenv "PLNX_DTC_HTTP_PORT")
 
     let warp10_url =
       Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
