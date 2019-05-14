@@ -1425,24 +1425,9 @@ module Actor_dtc = struct
   end
 end
 
-(* let dtcserver ~server ~port =
- *   in
- *   let cleanup () =
- *     Log_async.info begin fun m ->
- *       m "client %s disconnected" addr
- *     end >>= fun () ->
- *     Connection.remove addr ;
- *     Deferred.all_unit [Writer.close w; Reader.close r]
- *   in *)
-
 let main span timeout tls uid gid port sc () =
   sc_mode := sc ;
   update_client_span := span ;
-  (* let dtcserver ~server ~port =
-   *   dtcserver ~server ~port >>= fun dtc_server ->
-   *   Log_async.info (fun m -> m "DTC server started") >>= fun () ->
-   *   Tcp.Server.close_finished dtc_server
-   * in *)
   stage begin fun `Scheduler_started ->
     let logs =
       Option.Monad_infix.(Sys.getenv "OVH_LOGS_URL" >>| Uri.of_string) in
