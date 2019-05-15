@@ -214,19 +214,18 @@ module Actor_ws = struct
     let to_string t = Format.asprintf "%a" pp t
   end
   module E = struct
-    type evt =
+    type t =
       | Connect
       | Watchdog
       | Close_started
       | Close_finished
       | Snapshot of string
       | Trade of string
-    [@@deriving sexp]
+      | BookEntry of string
 
-    type t = {
-      ts: Time_ns.t ;
-      evt: evt ;
-    } [@@deriving sexp]
+      | TradesPerMinute of int
+      | BookEntriesPerMinute of int
+    [@@deriving sexp]
 
     let http_port =
       Option.map ~f:Int.of_string (Sys.getenv "PLNX_WS_HTTP_PORT")
@@ -234,23 +233,24 @@ module Actor_ws = struct
     let warp10_url =
       Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
 
-    let to_warp10 { evt ; _ } =
-      let labels, value =
-        match evt with
-        | Connect -> [], Warp10.String "connect"
-        | Watchdog -> [], Warp10.String "watchdog"
-        | Close_started -> [], Warp10.String "close_started"
-        | Close_finished -> [], Warp10.String "close_finished"
-        | Snapshot sym -> ["sym", sym], Warp10.String "snapshot"
-        | Trade sym -> ["sym", sym], Warp10.String "sym" in
-      Some (Warp10.create ~name:"poloniex.ws" ~labels value)
+    let to_warp10 = function
+      | TradesPerMinute i ->
+        Option.some @@ Warp10.create
+               ~labels:["event", "trades_per_minute"]
+               ~name:"poloniex.ws"
+               (Warp10.Long (Int64.of_int i))
+      | BookEntriesPerMinute i ->
+        Option.some @@ Warp10.create
+               ~labels:["event", "bookentries_per_minute"]
+               ~name:"poloniex.ws"
+               (Warp10.Long (Int64.of_int i))
+      | _ -> None
 
-    let dummy = { ts = Time_ns.epoch ; evt = Connect }
-    let event ?(ts=Time_ns.now ()) evt = { ts ; evt }
-    let level { evt ; _ } =
-      match evt with
-      | Trade _ -> Logs.Debug
+    let dummy = Connect
+    let level = function
+      | BookEntry _ -> Logs.Info
       | _ -> Logs.Info
+
     let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_t v)
   end
   module R = struct
@@ -286,16 +286,17 @@ module Actor_ws = struct
     let on_request self { R.ts ; evt = { chanid; seqnum = _; events } ; ret } =
       List.iter events ~f:begin function
         | Ws.Snapshot { symbol ; bid ; ask } ->
-          log_event_now self (E.event (Snapshot symbol)) ;
+          record_event self (Snapshot symbol) ;
           Int.Table.set subid_to_sym ~key:chanid ~data:symbol ;
           Book.set_bids ~symbol ~ts ~book:bid ;
           Book.set_asks ~symbol ~ts ~book:ask ;
         | BookEntry entry ->
           let symbol = Int.Table.find_exn subid_to_sym chanid in
+          record_event self (BookEntry symbol) ;
           on_book_update symbol ts entry
         | Trade t ->
           let symbol = Int.Table.find_exn subid_to_sym chanid in
-          log_event_now self (E.event (Trade symbol)) ;
+          record_event self (Trade symbol) ;
           on_trade_update symbol t
         | Ticker _ -> ()
       end ;
@@ -304,7 +305,7 @@ module Actor_ws = struct
     let init_connection self =
       let symbols = String.Table.keys tickers in
       Plnx_ws_async.connect () >>= fun (r, w, cleaned_up) ->
-      log_event self (E.event Connect) >>= fun () ->
+      log_event self Connect >>= fun () ->
       List.iter symbols ~f:begin fun symbol ->
         Pipe.write_without_pushback w
           (Ws.Subscribe (`String symbol, None))
@@ -317,18 +318,39 @@ module Actor_ws = struct
 
     let on_close self =
       let { V.r ; w ; cleaned_up } = !(state self) in
-      log_event self (E.event Close_started) >>= fun () ->
+      log_event self Close_started >>= fun () ->
       Pipe.close w ;
       Pipe.close_read r ;
       cleaned_up >>= fun () ->
-      log_event self (E.event Close_finished)
+      log_event self Close_finished
 
     let on_launch self _ _ =
-      init_connection self >>| ref
+      init_connection self >>= fun conn ->
+      let old_ts = ref Time_ns.min_value in
+      Clock_ns.every'
+        ~stop:conn.cleaned_up
+        ~continue_on_error:false (Time_ns.Span.of_int_sec 60)
+        begin fun () ->
+          let evts = latest_events ~after:!old_ts self in
+          old_ts := Time_ns.now () ;
+          let evts = List.Assoc.find_exn
+              ~equal:Pervasives.(=) evts Logs.Info in
+          let nb_trades =
+            Array.count evts ~f:begin fun (_, evt) ->
+              match evt with E.Trade _ -> true | _ -> false
+            end in
+          let nb_bookentries =
+            Array.count evts ~f:begin fun (_, evt) ->
+              match evt with E.BookEntry _ -> true | _ -> false
+            end in
+          log_event self (E.TradesPerMinute nb_trades) >>= fun () ->
+          log_event self (E.BookEntriesPerMinute nb_bookentries)
+        end ;
+      return (ref conn)
 
     let on_no_request self =
       (* Reinitialize dead connection *)
-      log_event self (E.event Watchdog) >>= fun () ->
+      log_event self Watchdog >>= fun () ->
       on_close self >>= fun () ->
       init_connection self >>= fun st ->
       (state self) := st ;
@@ -1267,32 +1289,8 @@ module Actor_dtc = struct
     let http_port =
       Option.map ~f:Int.of_string (Sys.getenv "PLNX_DTC_HTTP_PORT")
 
-    let warp10_url =
-      Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
-
-    let to_warp10 { src ; evt ; _ } =
-      let labels, value =
-        match evt with
-        | TCP_handler_error exn ->
-          ["exn", Exn.to_string exn], Warp10.String "tcp_error"
-        | Connection_io_error exn ->
-          ["exn", Exn.to_string exn], Warp10.String "io_error"
-
-        | Connect -> [], Warp10.String "connect"
-        | Disconnect -> [], Warp10.String "disconnect"
-        | Encoding_request -> [], Warp10.String "encoding"
-        | Logon_request -> [], Warp10.String "logon"
-        | Heartbeat -> [], Warp10.String "heartbeat"
-        | SecurityDefinitionForSymbolRequest sym ->
-          ["sym", sym], Warp10.String "secdef"
-        | MarketDataRequest { sym ; _ } ->
-          ["sym", sym], Warp10.String "data"
-        | MarketDepthRequest { sym ; _ } ->
-          ["sym", sym], Warp10.String "depth" in
-
-      let labels =
-        ("src", Socket.Address.Inet.to_string src) :: labels in
-      Some (Warp10.create ~name:"poloniex.dtc" ~labels value)
+    let warp10_url = None
+    let to_warp10 _ = None
 
     let create ?(ts=Time_ns.now ()) src evt = { ts ; src ; evt }
     let dummy = create
@@ -1452,11 +1450,17 @@ let main span timeout tls uid gid port sc () =
     Option.iter gid ~f:Core.Unix.setgid ;
     Actor_ws.launch
       (Actor_ws.bounded 10) ~timeout
-      (Actor.Types.create_limits ()) "" ()
+      (Actor.Types.create_limits
+         ?backlog_level:(Logs.Src.level src)
+         ~backlog_size:100_000
+         ()) "main" ()
       (module Actor_ws.Handlers) >>= fun _ws_worker ->
     Actor_dtc.launch
       (Actor_dtc.bounded 10)
-      (Actor.Types.create_limits ()) "" { server ; port }
+      (Actor.Types.create_limits
+         ?backlog_level:(Logs.Src.level src)
+         ~backlog_size:50_000
+         ()) "main" { server ; port }
       (module Actor_dtc.Handlers) >>= fun _dtc_worker ->
     Deferred.never ()
   end
