@@ -42,7 +42,7 @@ let remove k =
   active := AddrMap.remove !active k
 
 let iter = AddrMap.iter !active
-let length = AddrMap.length !active
+let length () = AddrMap.length !active
 
 let write_position_update ?(price=0.) ?(qty=0.) w symbol =
   let update = DTC.default_position_update () in

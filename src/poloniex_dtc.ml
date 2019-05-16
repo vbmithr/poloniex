@@ -31,6 +31,8 @@ module E = struct
                              sym : string }
     | MarketDepthRequest of { action : [`subscribe | `unsubscribe | `snapshot] ;
                               sym : string }
+
+    | NbConnected of int
   [@@deriving sexp_of]
 
   type t = {
@@ -41,10 +43,19 @@ module E = struct
   let http_port =
     Option.map ~f:Int.of_string (Sys.getenv "PLNX_DTC_HTTP_PORT")
 
-  let warp10_url = None
-  let to_warp10 _ = None
+  let warp10_url =
+    Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
+
+  let to_warp10 { evt ; _ } = match evt with
+    | NbConnected i ->
+      Option.some @@ Warp10.create
+        ~labels:["event", "nb_connected"]
+        ~name:"poloniex.dtc"
+        (Warp10.Long (Int64.of_int i))
+    | _ -> None
 
   let create src evt = { src ; evt }
+  let nb_connected src i = { src ; evt = NbConnected i }
   let dummy = create
       (Socket.Address.Inet.create Unix.Inet_addr.localhost ~port:0) Connect
   let level { evt ; _ } =
@@ -149,7 +160,7 @@ let secdef_of_symbol ?request_id ?(final=true) symbol =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
-let logon_request addr w msg =
+let logon_request self addr w msg =
   let req = DTC.parse_logon_request msg in
   let int1 = Option.value ~default:0l req.integer_1 in
   let int2 = Option.value ~default:0l req.integer_2 in
@@ -180,6 +191,7 @@ let logon_request addr w msg =
   begin match req.username, req.password, int2 with
     | Some key, Some secret, 0l ->
       let conn = Connection.setup ~addr ~w ~key ~secret ~send_secdefs in
+      record_event self (E.nb_connected addr (Connection.length ())) ;
       Restsync.Default.push_nowait begin fun () ->
         Connection.setup_trading ~key ~secret conn >>| function
         | true -> accept @@ Result.return "Valid Poloniex credentials"
@@ -187,6 +199,7 @@ let logon_request addr w msg =
       end
     | _ ->
       let _ = Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
+      record_event self (E.nb_connected addr (Connection.length ())) ;
       accept @@ Result.fail "No credentials"
   end
 
@@ -998,8 +1011,9 @@ let cancel_replace_order addr msg =
 
 let server_fun self addr r w =
   let on_connection_io_error exn =
+    Connection.remove addr ;
+    record_event self (E.nb_connected addr (Connection.length ())) ;
     log_event_now self (E.create addr (Connection_io_error exn)) ;
-    Connection.remove addr
   in
   (* So that process does not allocate all the time. *)
   let rec handle_chunk consumed buf ~pos ~len =
@@ -1020,6 +1034,7 @@ let server_fun self addr r w =
             write_message w `logoff DTC.gen_logoff
               { DTC.Logoff.reason = Some "bye" ;
                 do_not_reconnect = Some false }  ;
+            record_event self (E.nb_connected addr (Connection.length ())) ;
             log_event_now self (E.create addr Logoff) ;
           | `encoding_request ->
             log_event_now self (E.create addr Logon_request) ;
@@ -1031,7 +1046,7 @@ let server_fun self addr r w =
             end
           | `logon_request ->
             log_event_now self (E.create addr Logon_request) ;
-            logon_request addr w msg
+            logon_request self addr w msg
           | `heartbeat ->
             log_event_now self (E.create addr Heartbeat) ;
             heartbeat addr msg
@@ -1075,6 +1090,8 @@ module Handlers : HANDLERS
   type self = bounded queue t
 
   let on_handler_error self addr exn =
+    (* TODO: check handler error wrt connections *)
+    (* record_event self (E.nb_connected addr (Connection.length ())) ; *)
     log_event_now self (E.create addr (TCP_handler_error exn))
 
   let on_request _self { R.ret } =
