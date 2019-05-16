@@ -1292,7 +1292,7 @@ module Actor_dtc = struct
     let warp10_url = None
     let to_warp10 _ = None
 
-    let create ?(ts=Time_ns.now ()) src evt = { ts ; src ; evt }
+    let create src evt = { src ; evt }
     let dummy = create
         (Socket.Address.Inet.create Unix.Inet_addr.localhost ~port:0) Connect
     let level { evt ; _ } =
