@@ -1090,8 +1090,8 @@ module Handlers : HANDLERS
   type self = bounded queue t
 
   let on_handler_error self addr exn =
-    (* TODO: check handler error wrt connections *)
-    (* record_event self (E.nb_connected addr (Connection.length ())) ; *)
+    Connection.remove addr ;
+    record_event self (E.nb_connected addr (Connection.length ())) ;
     log_event_now self (E.create addr (TCP_handler_error exn))
 
   let on_request _self { R.ret } =
