@@ -1,7 +1,12 @@
 (executable
  (name poloniex)
  (public_name poloniex)
- (modules poloniex poloniex_global poloniex_util connection restsync)
+ (modules poloniex
+          poloniex_ws
+          poloniex_global
+          poloniex_util
+          connection
+          restsync)
  (package poloniex)
  (preprocess (pps ppx_let ppx_sexp_conv))
  (libraries

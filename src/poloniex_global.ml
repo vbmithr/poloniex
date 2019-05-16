@@ -2,6 +2,7 @@ open Core
 
 open Plnx
 module Rest = Plnx_rest
+module DTC = Dtc_pb.Dtcprotocol_piqi
 
 let src = Logs.Src.create "poloniex" ~doc:"Poloniex DTC"
 
@@ -48,3 +49,9 @@ let session_low : Float.t String.Table.t = String.Table.create ()
 let session_volume : Float.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
+
+let depth_update = DTC.default_market_depth_update_level ()
+let bidask_update = DTC.default_market_data_update_bid_ask ()
+let trade_update = DTC.default_market_data_update_trade ()
+let session_low_update = DTC.default_market_data_update_session_low ()
+let session_high_update = DTC.default_market_data_update_session_high ()
