@@ -1268,10 +1268,10 @@ module Actor_dtc = struct
       | Connection_io_error of Exn.t
 
       | Connect
-      | Disconnect
 
       | Encoding_request
       | Logon_request
+      | Logoff
       | Heartbeat
       | SecurityDefinitionForSymbolRequest of string
       | MarketDataRequest of { action : [`subscribe | `unsubscribe | `snapshot] ;
@@ -1343,6 +1343,12 @@ module Actor_dtc = struct
           let msg_str = Bigstring.To_string.subo buf ~pos:(pos+4) ~len:(msglen-4) in
           let msg = Piqirun.init_from_string msg_str in
           begin match msgtype with
+            | `logoff ->
+              let _ = DTC.parse_logoff msg in
+              write_message w `logoff DTC.gen_logoff
+                { DTC.Logoff.reason = Some "bye" ;
+                  do_not_reconnect = Some false }  ;
+              log_event_now self (E.create addr Logoff) ;
             | `encoding_request ->
               log_event_now self (E.create addr Logon_request) ;
               begin match (Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
