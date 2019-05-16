@@ -42,6 +42,7 @@ let remove k =
   active := AddrMap.remove !active k
 
 let iter = AddrMap.iter !active
+let length = AddrMap.length !active
 
 let write_position_update ?(price=0.) ?(qty=0.) w symbol =
   let update = DTC.default_position_update () in
@@ -231,11 +232,11 @@ let setup ~addr ~w ~key ~secret ~send_secdefs =
     positions = String.Table.create () ;
   } in
   set ~key:addr ~data:conn ;
-  if key = "" || secret = "" then Deferred.return false
-  else begin
-    Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
-    | Error _ -> false
-    | Ok _ ->
-      update_connection conn !update_client_span ;
-      true
-  end
+  conn
+
+let setup_trading ~key ~secret conn =
+  Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
+  | Error _ -> false
+  | Ok _ ->
+    update_connection conn !update_client_span ;
+    true

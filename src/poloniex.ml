@@ -437,16 +437,15 @@ let logon_request addr w msg =
   in
   begin match req.username, req.password, int2 with
     | Some key, Some secret, 0l ->
+      let conn = Connection.setup ~addr ~w ~key ~secret ~send_secdefs in
       RestSync.Default.push_nowait begin fun () ->
-        Connection.setup ~addr ~w ~key ~secret ~send_secdefs >>| function
+        Connection.setup_trading ~key ~secret conn >>| function
         | true -> accept @@ Result.return "Valid Poloniex credentials"
         | false -> accept @@ Result.fail "Invalid Poloniex crendentials"
       end
     | _ ->
-      RestSync.Default.push_nowait begin fun () ->
-        Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs >>| fun _ ->
-        accept @@ Result.fail "No credentials"
-      end
+      let _ = Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
+      accept @@ Result.fail "No credentials"
   end
 
 let heartbeat _addr _msg =
@@ -1281,7 +1280,6 @@ module Actor_dtc = struct
     [@@deriving sexp_of]
 
     type t = {
-      ts: Time_ns.t ;
       src: Socket.Address.Inet.t ;
       evt: evt ;
     } [@@deriving sexp_of]
