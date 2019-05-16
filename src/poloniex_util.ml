@@ -27,3 +27,9 @@ let conduit_server ?tls () =
     match crt_exists, key_exists with
     | `Yes, `Yes -> `OpenSSL (`Crt_file_path crt, `Key_file_path key)
     | _ -> failwith "TLS crt/key file not found"
+
+let float_of_time ts = Int63.to_float (Time_ns.to_int63_ns_since_epoch ts) /. 1e9
+let int63_of_time ts = Int63.(Time_ns.to_int63_ns_since_epoch ts / of_int 1_000_000_000)
+let int64_of_time ts = Int63.to_int64 (int63_of_time ts)
+let int32_of_time ts = Int63.to_int32_exn (int63_of_time ts)
+
