@@ -243,19 +243,24 @@ module Handlers : HANDLERS
     end ;
     return ret
 
-  let init_connection self =
+  let rec init_connection self =
     let symbols = String.Table.keys tickers in
-    Plnx_ws_async.connect () >>= fun (r, w, cleaned_up) ->
-    log_event self Connect >>= fun () ->
-    List.iter symbols ~f:begin fun symbol ->
-      Pipe.write_without_pushback w
-        (Ws.Subscribe (`String symbol, None))
-    end ;
-    let push_request evt =
-      let ts = Time_ns.now () in
-      push_request self { ts ; evt ; ret = () } in
-    don't_wait_for (Pipe.iter r ~f:push_request) ;
-    return { V.r ; w ; cleaned_up }
+    Monitor.try_with Plnx_ws_async.connect >>= function
+    | Error exn ->
+      Log_async.err (fun m -> m "%a" Exn.pp exn) >>= fun () ->
+      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
+      init_connection self
+    | Ok (r, w, cleaned_up) ->
+      log_event self Connect >>= fun () ->
+      List.iter symbols ~f:begin fun symbol ->
+        Pipe.write_without_pushback w
+          (Ws.Subscribe (`String symbol, None))
+      end ;
+      let push_request evt =
+        let ts = Time_ns.now () in
+        push_request self { ts ; evt ; ret = () } in
+      don't_wait_for (Pipe.iter r ~f:push_request) ;
+      return { V.r ; w ; cleaned_up }
 
   let on_close self =
     let { V.r ; w ; cleaned_up } = !(state self) in
