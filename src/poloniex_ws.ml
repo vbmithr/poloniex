@@ -267,8 +267,8 @@ module Handlers : HANDLERS
     log_event self Close_started >>= fun () ->
     Pipe.close w ;
     Pipe.close_read r ;
-    cleaned_up >>= fun () ->
-    log_event self Close_finished
+    don't_wait_for (cleaned_up >>= fun () -> log_event self Close_finished) ;
+    Deferred.unit
 
   let on_launch self _ _ =
     init_connection self >>= fun conn ->
