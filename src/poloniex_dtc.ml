@@ -16,6 +16,26 @@ module N = struct
   let to_string t = Format.asprintf "%a" pp t
 end
 module E = struct
+  type trade_mode_enum =
+    [ `trade_mode_demo
+    | `trade_mode_live
+    | `trade_mode_simulated
+    | `trade_mode_unset ] [@@deriving sexp]
+
+  type logon_request = DTC.Logon_request.t = {
+    mutable protocol_version : int32 option;
+    mutable username : string option;
+    mutable password : string option [@opaque] ;
+    mutable general_text_data : string option;
+    mutable integer_1 : int32 option;
+    mutable integer_2 : int32 option;
+    mutable heartbeat_interval_in_seconds : int32 option;
+    mutable trade_mode : trade_mode_enum option;
+    mutable trade_account : string option;
+    mutable hardware_identifier : string option;
+    mutable client_name : string option;
+  } [@@deriving sexp]
+
   type evt =
     | TCP_handler_error of Exn.t
     | Connection_io_error of Exn.t
@@ -23,9 +43,10 @@ module E = struct
     | Connect
 
     | Encoding_request
-    | Logon_request
+    | Logon_request of logon_request
     | Logoff
-    | Heartbeat
+    | Heartbeat_sent
+    | Heartbeat_recv
     | SecurityDefinitionForSymbolRequest of string
     | MarketDataRequest of { action : [`subscribe | `unsubscribe | `snapshot] ;
                              sym : string }
@@ -90,17 +111,16 @@ include A
 let encoding_request addr w =
   Log.debug
     (fun m -> m "<- [%a] Encoding Request" pp_print_addr addr) ;
-  Encoding.(to_string (Response { version = 7 ; encoding = Protobuf })) |>
-  Writer.write w ;
+  Writer.write w
+    Encoding.(to_string (Response { version = 8 ; encoding = Protobuf })) ;
   Log.debug
     (fun m -> m "-> [%a] Encoding Response" pp_print_addr addr)
 
-
-let logon_response ~result_text ~trading_supported =
+let logon_response ~result ~result_text ~trading_supported =
   let resp = DTC.default_logon_response () in
   resp.server_name <- Some "Poloniex" ;
-  resp.protocol_version <- Some 7l ;
-  resp.result <- Some `logon_success ;
+  resp.protocol_version <- Some 8l ;
+  resp.result <- Some result ;
   resp.result_text <- Some result_text ;
   resp.market_depth_updates_best_bid_and_ask <- Some true ;
   resp.trading_is_supported <- Some trading_supported ;
@@ -144,47 +164,66 @@ let secdef_of_symbol ?request_id ?(final=true) symbol =
   secdef.has_market_depth_data <- Some true ;
   secdef
 
-let logon_request self addr w msg =
-  let req = DTC.parse_logon_request msg in
-  let int1 = Option.value ~default:0l req.integer_1 in
+let logon_accept w addr send_secdefs trading =
+  let trading_supported, result_text =
+    match trading with
+    | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg
+    | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
+  in
+  write_message w `logon_response DTC.gen_logon_response
+    (logon_response ~result:`logon_success ~trading_supported ~result_text) ;
+  Log.debug begin fun m ->
+    m "-> [%a] Logon Response (%s)" pp_print_addr addr result_text
+  end ;
+  if not !sc_mode || send_secdefs then begin
+    String.Table.iteri tickers ~f:begin fun ~key:symbol ~data:_ ->
+      let secdef = secdef_of_symbol ~final:true symbol in
+      write_message w `security_definition_response
+        DTC.gen_security_definition_response secdef ;
+      Log.debug (fun m -> m "Written secdef %s" symbol)
+    end
+  end
+
+let logon_reject addr w result_text =
+  write_message w `logon_response DTC.gen_logon_response
+    (logon_response ~result:`logon_error ~trading_supported:false ~result_text) ;
+  Log.debug begin fun m ->
+    m "-> [%a] Logon Response (%s)" pp_print_addr addr result_text
+  end
+
+let logon_request self addr w req =
+  let int1 = Option.value ~default:0l req.DTC.Logon_request.integer_1 in
   let int2 = Option.value ~default:0l req.integer_2 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
   Log.debug
     (fun m -> m "<- [%a] Logon Request" pp_print_addr addr) ;
-  let accept trading =
-    let trading_supported, result_text =
-      match trading with
-      | Ok msg -> true, Printf.sprintf "Trading enabled: %s" msg
-      | Error msg -> false, Printf.sprintf "Trading disabled: %s" msg
-    in
-    don't_wait_for @@ heartbeat addr w req.heartbeat_interval_in_seconds;
-    write_message w `logon_response
-      DTC.gen_logon_response (logon_response ~trading_supported ~result_text) ;
-    Log.debug begin fun m ->
-      m "-> [%a] Logon Response (%s)" pp_print_addr addr result_text
-    end ;
-    if not !sc_mode || send_secdefs then begin
-      String.Table.iteri tickers ~f:begin fun ~key:symbol ~data:_ ->
-        let secdef = secdef_of_symbol ~final:true symbol in
-        write_message w `security_definition_response
-          DTC.gen_security_definition_response secdef ;
-        Log.debug (fun m -> m "Written secdef %s" symbol)
+  match req.heartbeat_interval_in_seconds with
+  | None ->
+    logon_reject addr w "Heartbeat not set"
+  | Some hb_interval ->
+    let hb_interval = Int32.to_int_exn hb_interval in
+    let log_evt () =
+      log_event_now self (E.create addr Heartbeat_sent) in
+    match req.username, req.password, int2 with
+    | Some key, Some secret, 0l ->
+      let conn = Connection.setup ~log_evt ~addr ~w ~key
+          ~secret ~send_secdefs ~hb_interval in
+      record_event self (E.nb_connected addr (Connection.length ())) ;
+      Restsync.Default.push_nowait begin fun () ->
+        Connection.setup_trading ~key ~secret conn >>| function
+        | true ->
+          logon_accept w addr send_secdefs
+            (Result.return "Valid Poloniex credentials")
+        | false ->
+          logon_accept w addr send_secdefs
+            (Result.fail "Invalid Poloniex crendentials")
       end
-    end
-  in
-  match req.username, req.password, int2 with
-  | Some key, Some secret, 0l ->
-    let conn = Connection.setup ~addr ~w ~key ~secret ~send_secdefs in
-    record_event self (E.nb_connected addr (Connection.length ())) ;
-    Restsync.Default.push_nowait begin fun () ->
-      Connection.setup_trading ~key ~secret conn >>| function
-      | true -> accept @@ Result.return "Valid Poloniex credentials"
-      | false -> accept @@ Result.fail "Invalid Poloniex crendentials"
-    end
-  | _ ->
-    let _ = Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
-    record_event self (E.nb_connected addr (Connection.length ())) ;
-    accept @@ Result.fail "No credentials"
+    | _ ->
+      let (_: Connection.t) =
+        Connection.setup ~log_evt ~addr ~w ~key:"" ~secret:""
+          ~send_secdefs ~hb_interval in
+      record_event self (E.nb_connected addr (Connection.length ())) ;
+      logon_accept w addr send_secdefs (Result.fail "No credentials")
 
 let heartbeat _addr _msg =
   (* TODO: do something? *)
@@ -1024,10 +1063,11 @@ let server_fun self addr r w =
               | Some _ -> encoding_request addr w
             end
           | `logon_request ->
-            log_event_now self (E.create addr Logon_request) ;
-            logon_request self addr w msg
+            let req = DTC.parse_logon_request msg in
+            log_event_now self (E.create addr (Logon_request req)) ;
+            logon_request self addr w req
           | `heartbeat ->
-            log_event_now self (E.create addr Heartbeat) ;
+            log_event_now self (E.create addr Heartbeat_recv) ;
             heartbeat addr msg
           | `security_definition_for_symbol_request ->
             let log_evt sym = log_event_now self

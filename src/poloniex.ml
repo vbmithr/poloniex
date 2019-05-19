@@ -21,7 +21,7 @@ let failure_of_error e =
   | Failure msg -> Some msg
   | _ -> None
 
-let main span timeout tls uid gid port sc () =
+let main span timeout tls uid gid port sc =
   sc_mode := sc ;
   update_client_span := span ;
   stage begin fun `Scheduler_started ->
@@ -100,6 +100,6 @@ let () =
           match crt, key with
           | Some crt, Some key -> Some (crt, key)
           | _ -> None in
-        main client_span timeout tls uid gid port sc ()
+        main client_span timeout tls uid gid port sc
     ]
   |> Command.run
