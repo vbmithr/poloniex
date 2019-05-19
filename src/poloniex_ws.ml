@@ -205,13 +205,16 @@ module R = struct
   let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_view v)
 end
 module V = struct
-  type state_ =
+  type conn =
     { r : Plnx_ws.t Pipe.Reader.t ;
       w : Plnx_ws.command Pipe.Writer.t ;
       cleaned_up : unit Deferred.t ;
     }
 
-  type state = state_ ref
+  type state = {
+    buf : Bi_outbuf.t ;
+    mutable conn : conn
+  }
   type parameters = unit
   type view = unit
   let view _ () = ()
@@ -243,13 +246,18 @@ module Handlers : HANDLERS
     end ;
     return ret
 
-  let rec init_connection self =
+  let rec init_connection ?buf self =
+    let buf =
+      match status self, buf with
+      | Launching _, None -> invalid_arg "init_connection"
+      | Launching _, Some buf -> buf
+      | _, _ -> (state self).buf in
     let symbols = String.Table.keys tickers in
-    Monitor.try_with Plnx_ws_async.connect >>= function
+    Monitor.try_with (fun () -> Plnx_ws_async.connect ~buf ()) >>= function
     | Error exn ->
       Log_async.err (fun m -> m "%a" Exn.pp exn) >>= fun () ->
       Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
-      init_connection self
+      init_connection ~buf self
     | Ok (r, w, cleaned_up) ->
       log_event self Connect >>= fun () ->
       List.iter symbols ~f:begin fun symbol ->
@@ -263,7 +271,7 @@ module Handlers : HANDLERS
       return { V.r ; w ; cleaned_up }
 
   let on_close self =
-    let { V.r ; w ; cleaned_up } = !(state self) in
+    let { V.conn = { V.r ; w ; cleaned_up } ; _ } = state self in
     log_event self Close_started >>= fun () ->
     Pipe.close w ;
     Pipe.close_read r ;
@@ -271,7 +279,8 @@ module Handlers : HANDLERS
     Deferred.unit
 
   let on_launch self _ _ =
-    init_connection self >>= fun conn ->
+    let buf = Bi_outbuf.create 4096 in
+    init_connection ~buf self >>= fun conn ->
     let old_ts = ref Time_ns.min_value in
     Clock_ns.every'
       ~stop:conn.cleaned_up
@@ -292,14 +301,15 @@ module Handlers : HANDLERS
         log_event self (E.TradesPerMinute nb_trades) >>= fun () ->
         log_event self (E.BookEntriesPerMinute nb_bookentries)
       end ;
-    return (ref conn)
+    return { V.buf ; conn }
 
   let on_no_request self =
     (* Reinitialize dead connection *)
     log_event self Watchdog >>= fun () ->
     on_close self >>= fun () ->
-    init_connection self >>= fun st ->
-    (state self) := st ;
+    init_connection self >>= fun conn ->
+    let s = state self in
+    s.conn <- conn ;
     Deferred.unit
 
   let on_completion _self _req _arg _status =
