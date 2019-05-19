@@ -95,22 +95,6 @@ let encoding_request addr w =
   Log.debug
     (fun m -> m "-> [%a] Encoding Response" pp_print_addr addr)
 
-let heartbeat addr w ival =
-  let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
-  let msg = DTC.default_heartbeat () in
-  let rec loop () =
-    Clock_ns.after @@ Time_ns.Span.of_int_sec ival >>= fun () ->
-    match Connection.find addr with
-    | None -> Deferred.unit
-    | Some { Connection.dropped ; _ } ->
-      Log_async.debug begin fun m ->
-        m "-> [%a] Heartbeat" pp_print_addr addr
-      end >>= fun () ->
-      msg.num_dropped_messages <- Some (Int32.of_int_exn dropped) ;
-      write_message w `heartbeat DTC.gen_heartbeat msg ;
-      loop ()
-  in
-  loop ()
 
 let logon_response ~result_text ~trading_supported =
   let resp = DTC.default_logon_response () in

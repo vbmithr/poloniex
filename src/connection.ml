@@ -11,6 +11,7 @@ open Poloniex_util
 type t = {
   addr: Socket.Address.Inet.t;
   w: Writer.t;
+  hb_interval: int;
   key: string;
   secret: string;
   mutable dropped: int;
@@ -211,12 +212,23 @@ let update_connection conn span =
       push_nowait (fun () -> update_balances conn) ;
     end
 
-let setup ~addr ~w ~key ~secret ~send_secdefs =
+let start_hb log_evt ({ w ; hb_interval ; _ } as conn) =
+  let msg = DTC.default_heartbeat () in
+  Clock_ns.every
+    ~stop:(Writer.close_started w) ~continue_on_error:false
+    (Time_ns.Span.of_int_sec hb_interval) begin fun () ->
+    log_evt () ;
+    msg.num_dropped_messages <- Some (Int32.of_int_exn conn.dropped) ;
+    write_message w `heartbeat DTC.gen_heartbeat msg
+  end
+
+let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
   let conn = {
     addr ;
     w ;
     key ;
     secret ;
+    hb_interval ;
     send_secdefs ;
     dropped = 0 ;
     subs = String.Table.create () ;
@@ -231,6 +243,7 @@ let setup ~addr ~w ~key ~secret ~send_secdefs =
     trades = String.Table.create () ;
     positions = String.Table.create () ;
   } in
+  start_hb log_evt conn ;
   set ~key:addr ~data:conn ;
   conn
 
