@@ -942,12 +942,8 @@ let cancel_replace_order addr msg =
   Log.debug begin fun m ->
     m "<- [%a] Cancel Replace Order" pp_print_addr addr
   end ;
-  let order_type = Option.value ~default:`order_type_unset req.order_type in
   let tif = Option.value ~default:`tif_unset req.time_in_force in
-  if order_type <> `order_type_unset then
-    reject_cancel_replace_order addr w req
-      "Modification of order type is not supported by Poloniex"
-  else if tif <> `tif_unset then
+  if tif <> `tif_unset then
     reject_cancel_replace_order addr w req
       "Modification of time in force is not supported by Poloniex"
   else
