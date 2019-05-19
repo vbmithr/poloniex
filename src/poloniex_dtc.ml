@@ -1037,7 +1037,7 @@ let server_fun self addr r w =
             record_event self (E.nb_connected addr (Connection.length ())) ;
             log_event_now self (E.create addr Logoff) ;
           | `encoding_request ->
-            log_event_now self (E.create addr Logon_request) ;
+            log_event_now self (E.create addr Encoding_request) ;
             begin match (Encoding.read (Bigstring.To_string.subo buf ~pos ~len:16)) with
               | None -> Log.err begin fun m ->
                   m "Invalid encoding request received"
