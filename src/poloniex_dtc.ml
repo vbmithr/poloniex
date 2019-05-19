@@ -188,20 +188,19 @@ let logon_request self addr w msg =
       end
     end
   in
-  begin match req.username, req.password, int2 with
-    | Some key, Some secret, 0l ->
-      let conn = Connection.setup ~addr ~w ~key ~secret ~send_secdefs in
-      record_event self (E.nb_connected addr (Connection.length ())) ;
-      Restsync.Default.push_nowait begin fun () ->
-        Connection.setup_trading ~key ~secret conn >>| function
-        | true -> accept @@ Result.return "Valid Poloniex credentials"
-        | false -> accept @@ Result.fail "Invalid Poloniex crendentials"
-      end
-    | _ ->
-      let _ = Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
-      record_event self (E.nb_connected addr (Connection.length ())) ;
-      accept @@ Result.fail "No credentials"
-  end
+  match req.username, req.password, int2 with
+  | Some key, Some secret, 0l ->
+    let conn = Connection.setup ~addr ~w ~key ~secret ~send_secdefs in
+    record_event self (E.nb_connected addr (Connection.length ())) ;
+    Restsync.Default.push_nowait begin fun () ->
+      Connection.setup_trading ~key ~secret conn >>| function
+      | true -> accept @@ Result.return "Valid Poloniex credentials"
+      | false -> accept @@ Result.fail "Invalid Poloniex crendentials"
+    end
+  | _ ->
+    let _ = Connection.setup ~addr ~w ~key:"" ~secret:"" ~send_secdefs in
+    record_event self (E.nb_connected addr (Connection.length ())) ;
+    accept @@ Result.fail "No credentials"
 
 let heartbeat _addr _msg =
   (* TODO: do something? *)
