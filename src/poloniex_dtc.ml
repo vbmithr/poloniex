@@ -225,11 +225,6 @@ let logon_request self addr w req =
       record_event self (E.nb_connected addr (Connection.length ())) ;
       logon_accept w addr send_secdefs (Result.fail "No credentials")
 
-let heartbeat _addr _msg =
-  (* TODO: do something? *)
-  (* Log.debug log_dtc "<- [%s] Heartbeat" addr *)
-  ()
-
 let security_definition_request log_evt addr w msg =
   let reject request_id symbol =
     Log.info begin fun m ->
@@ -1068,7 +1063,7 @@ let server_fun self addr r w =
             logon_request self addr w req
           | `heartbeat ->
             log_event_now self (E.create addr Heartbeat_recv) ;
-            heartbeat addr msg
+            Connection.record_hb addr
           | `security_definition_for_symbol_request ->
             let log_evt sym = log_event_now self
                 (E.create addr (SecurityDefinitionForSymbolRequest sym)) in
@@ -1120,6 +1115,7 @@ module Handlers : HANDLERS
     Deferred.unit
 
   let on_launch self _name { V.server ; port } =
+    let _stop_gc = Connection.gc () in
     Conduit_async.serve
       ~on_handler_error:(`Call (on_handler_error self))
       server (Tcp.Where_to_listen.of_port port)

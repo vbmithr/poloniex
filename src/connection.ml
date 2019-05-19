@@ -15,6 +15,7 @@ type t = {
   key: string;
   secret: string;
   mutable dropped: int;
+  mutable most_recent_hb_ts : Time_ns.t;
   subs: Int32.t String.Table.t;
   rev_subs : string Int32.Table.t;
   subs_depth: Int32.t String.Table.t;
@@ -222,6 +223,32 @@ let start_hb log_evt ({ w ; hb_interval ; _ } as conn) =
     write_message w `heartbeat DTC.gen_heartbeat msg
   end
 
+let purge { addr ; w ; _ } =
+  Writer.close w >>= fun () ->
+  Log_async.info (fun m -> m "cleaning up connection %a" pp_print_addr addr)
+
+let gc () =
+  let stop = Ivar.create () in
+  Clock_ns.every ~stop:(Ivar.read stop)
+    ~continue_on_error:false
+    (Time_ns.Span.of_int_sec 600) begin fun () ->
+    let now = Time_ns.now () in
+    active :=
+      AddrMap.fold !active ~init:AddrMap.empty ~f:begin fun ~key ~data a ->
+        if data.most_recent_hb_ts > Time_ns.epoch &&
+           Time_ns.diff now data.most_recent_hb_ts >
+           Time_ns.Span.of_int_sec 240
+        then (don't_wait_for (purge data) ; a)
+        else AddrMap.set a ~key ~data
+      end
+  end ;
+  stop
+
+let record_hb addr =
+  match find addr with
+  | None -> ()
+  | Some c -> c.most_recent_hb_ts <- Time_ns.now ()
+
 let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
   let conn = {
     addr ;
@@ -231,6 +258,7 @@ let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
     hb_interval ;
     send_secdefs ;
     dropped = 0 ;
+    most_recent_hb_ts = Time_ns.epoch ;
     subs = String.Table.create () ;
     rev_subs = Int32.Table.create () ;
     subs_depth = String.Table.create () ;
