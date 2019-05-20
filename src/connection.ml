@@ -229,7 +229,7 @@ let start_hb log_evt ({ w ; hb_interval ; _ } as conn) =
 
 let purge { addr ; w ; _ } =
   Writer.close w >>= fun () ->
-  Log_async.info (fun m -> m "cleaning up connection %a" pp_print_addr addr)
+  Log_async.info (fun m -> m "purged connection %a" pp_print_addr addr)
 
 let gc () =
   let stop = Ivar.create () in
@@ -254,6 +254,7 @@ let record_hb addr =
   | Some c -> c.most_recent_hb_ts <- Time_ns.now ()
 
 let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
+  Log.debug (fun m -> m "Setup connection for %a" pp_print_addr addr) ;
   let conn = {
     addr ;
     w ;

@@ -193,10 +193,7 @@ let logon_reject addr w result_text =
 
 let logon_request self addr w req =
   let int1 = Option.value ~default:0l req.DTC.Logon_request.integer_1 in
-  let int2 = Option.value ~default:0l req.integer_2 in
   let send_secdefs = Int32.(bit_and int1 128l <> 0l) in
-  Log.debug
-    (fun m -> m "<- [%a] Logon Request" pp_print_addr addr) ;
   match req.heartbeat_interval_in_seconds with
   | None ->
     logon_reject addr w "Heartbeat not set"
@@ -204,10 +201,22 @@ let logon_request self addr w req =
     let hb_interval = Int32.to_int_exn hb_interval in
     let log_evt () =
       log_event_now self (E.create addr Heartbeat_sent) in
-    match req.username, req.password, int2 with
-    | Some key, Some secret, 0l ->
-      let conn = Connection.setup ~log_evt ~addr ~w ~key
-          ~secret ~send_secdefs ~hb_interval in
+    let key = Option.value ~default:"" req.username in
+    let secret = Option.value ~default:"" req.password in
+    match key, secret with
+    | "", _ | _, "" ->
+      Log.debug
+        (fun m -> m "<- [%a] Anonymous Logon Request" pp_print_addr addr) ;
+      let (_: Connection.t) = Connection.setup
+          ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval in
+      record_event self (E.nb_connected addr (Connection.length ())) ;
+      logon_accept w addr send_secdefs (Result.fail "No credentials")
+    | _ ->
+      Log.debug begin fun m ->
+        m "<- [%a] User Logon Request (%s)" pp_print_addr addr key
+      end ;
+      let conn = Connection.setup
+          ~log_evt ~addr ~w ~key  ~secret ~send_secdefs ~hb_interval in
       record_event self (E.nb_connected addr (Connection.length ())) ;
       Restsync.Default.push_nowait begin fun () ->
         Connection.setup_trading ~key ~secret conn >>| function
@@ -218,12 +227,6 @@ let logon_request self addr w req =
           logon_accept w addr send_secdefs
             (Result.fail "Invalid Poloniex crendentials")
       end
-    | _ ->
-      let (_: Connection.t) =
-        Connection.setup ~log_evt ~addr ~w ~key:"" ~secret:""
-          ~send_secdefs ~hb_interval in
-      record_event self (E.nb_connected addr (Connection.length ())) ;
-      logon_accept w addr send_secdefs (Result.fail "No credentials")
 
 let security_definition_request log_evt addr w msg =
   let reject request_id symbol =
@@ -1024,7 +1027,7 @@ let cancel_replace_order addr msg =
 
 let server_fun self addr r w =
   let on_connection_io_error exn =
-    Connection.remove addr ;
+    Connection.remove addr "connection_io_error %a" Exn.pp exn ;
     record_event self (E.nb_connected addr (Connection.length ())) ;
     log_event_now self (E.create addr (Connection_io_error exn)) ;
   in
@@ -1059,8 +1062,10 @@ let server_fun self addr r w =
             end
           | `logon_request ->
             let req = DTC.parse_logon_request msg in
-            log_event_now self (E.create addr (Logon_request req)) ;
-            logon_request self addr w req
+            don't_wait_for begin
+              log_event self (E.create addr (Logon_request req)) >>| fun () ->
+              logon_request self addr w req
+            end
           | `heartbeat ->
             log_event_now self (E.create addr Heartbeat_recv) ;
             Connection.record_hb addr
@@ -1103,11 +1108,6 @@ module Handlers : HANDLERS
 
   type self = bounded queue t
 
-  let on_handler_error self addr exn =
-    Connection.remove addr ;
-    record_event self (E.nb_connected addr (Connection.length ())) ;
-    log_event_now self (E.create addr (TCP_handler_error exn))
-
   let on_request _self { R.ret } =
     return ret
 
@@ -1115,6 +1115,10 @@ module Handlers : HANDLERS
     Deferred.unit
 
   let on_launch self _name { V.server ; port } =
+    let on_handler_error self addr exn =
+      Connection.remove addr "handler_error %a" Exn.pp exn ;
+      record_event self (E.nb_connected addr (Connection.length ())) ;
+      log_event_now self (E.create addr (TCP_handler_error exn)) in
     let _stop_gc = Connection.gc () in
     Conduit_async.serve
       ~on_handler_error:(`Call (on_handler_error self))
