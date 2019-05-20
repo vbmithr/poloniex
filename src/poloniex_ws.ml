@@ -207,7 +207,6 @@ end
 module V = struct
   type conn =
     { r : Plnx_ws.t Pipe.Reader.t ;
-      w : Plnx_ws.command Pipe.Writer.t ;
       cleaned_up : unit Deferred.t ;
     }
 
@@ -264,16 +263,16 @@ module Handlers : HANDLERS
         Pipe.write_without_pushback w
           (Ws.Subscribe (`String symbol, None))
       end ;
+      Pipe.close w ;
       let push_request evt =
         let ts = Time_ns.now () in
         push_request self { ts ; evt ; ret = () } in
       don't_wait_for (Pipe.iter r ~f:push_request) ;
-      return { V.r ; w ; cleaned_up }
+      return { V.r ; cleaned_up }
 
   let on_close self =
-    let { V.conn = { V.r ; w ; cleaned_up } ; _ } = state self in
+    let { V.conn = { V.r ; cleaned_up } ; _ } = state self in
     log_event self Close_started >>= fun () ->
-    Pipe.close w ;
     Pipe.close_read r ;
     don't_wait_for (cleaned_up >>= fun () -> log_event self Close_finished) ;
     Deferred.unit
