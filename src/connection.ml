@@ -36,14 +36,18 @@ module AddrMap = Map.Make(Socket.Address.Inet.Blocking_sexp)
 
 let active = ref AddrMap.empty
 
-let find = AddrMap.find !active
-let find_exn = AddrMap.find_exn !active
+let find key = AddrMap.find !active key
+let find_exn key = AddrMap.find_exn !active key
 let set ~key ~data =
+  Log.debug (fun m -> m "Set connection %a" pp_print_addr key) ;
   active := AddrMap.set !active ~key ~data
 let remove k =
-  active := AddrMap.remove !active k
+  Format.kasprintf begin fun reason ->
+    Log.debug (fun m -> m "Removed connection %a (%s)" pp_print_addr k reason) ;
+    active := AddrMap.remove !active k
+  end
 
-let iter = AddrMap.iter !active
+let iter ~f = AddrMap.iter !active ~f
 let length () = AddrMap.length !active
 
 let write_position_update ?(price=0.) ?(qty=0.) w symbol =
