@@ -252,23 +252,24 @@ module Handlers : HANDLERS
       | Launching _, Some buf -> buf
       | _, _ -> (state self).buf in
     let symbols = String.Table.keys tickers in
-    Monitor.try_with (fun () -> Plnx_ws_async.connect ~buf ()) >>= function
-    | Error exn ->
-      Log_async.err (fun m -> m "%a" Exn.pp exn) >>= fun () ->
-      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
-      init_connection ~buf self
-    | Ok (r, w, cleaned_up) ->
+    Monitor.try_with begin fun () ->
+      Plnx_ws_async.connect ~buf () >>= fun (r, w, cleaned_up) ->
       log_event self Connect >>= fun () ->
-      List.iter symbols ~f:begin fun symbol ->
-        Pipe.write_without_pushback w
-          (Ws.Subscribe (`String symbol, None))
-      end ;
+      Deferred.List.iter symbols ~f:begin fun symbol ->
+        Pipe.write w (Ws.Subscribe (`String symbol, None))
+      end >>= fun () ->
       Pipe.close w ;
       let push_request evt =
         let ts = Time_ns.now () in
         push_request self { ts ; evt ; ret = () } in
       don't_wait_for (Pipe.iter r ~f:push_request) ;
       return { V.r ; cleaned_up }
+    end >>= function
+    | Ok c -> return c
+    | Error exn ->
+      Log_async.err (fun m -> m "%a" Exn.pp exn) >>= fun () ->
+      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
+      init_connection ~buf self
 
   let on_close self =
     let { V.conn = { V.r ; cleaned_up } ; _ } = state self in
