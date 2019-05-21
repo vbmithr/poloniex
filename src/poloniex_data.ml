@@ -63,13 +63,13 @@ module CtrlFile = struct
       let latest = Time_ns.(end_ts >= now_ts) in
       let thunks =
         if i >= 0 then begin
-            if not (Bitv.get bitv i) || latest then
-              begin fun () -> f ~start_ts ~end_ts >>| function
-                | Error err -> Logs.err ~src (fun m -> m "%a" REST.Http_error.pp err)
-                | Ok _ -> Bitv.set bitv i true
-              end :: thunks
-            else thunks
-          end
+          if not (Bitv.get bitv i) || latest then
+            begin fun () -> f ~start_ts ~end_ts >>| function
+              | Error err -> Logs.err ~src (fun m -> m "%a" REST.Http_error.pp err)
+              | Ok _ -> Bitv.set bitv i true
+            end :: thunks
+          else thunks
+        end
         else begin fun () ->
           f ~start_ts ~end_ts >>| Result.iter_error ~f:begin fun err ->
             Logs.err ~src (fun m -> m "%a" REST.Http_error.pp err)
@@ -144,94 +144,26 @@ end
 
 let dry_run = ref false
 
-let mk_store_trade_in_db () =
-  let tss = String.Table.create () in
-  fun symbol { Trade.ts; price; qty; side; _ } ->
-    if !dry_run || side = `buy_sell_unset then ()
-    else
-      let { Instrument.db; _ } = Instrument.find_exn symbol in
-      let ts = match String.Table.find tss symbol with
-        | None ->
-          String.Table.add_exn tss ~key:symbol ~data:(ts, 0);
-          REST.of_ptime ts
-        | Some (old_ts, _) when old_ts <> ts ->
-          String.Table.set tss ~key:symbol ~data:(ts, 0);
-          REST.of_ptime ts
-        | Some (_, n) ->
-          String.Table.set tss ~key:symbol ~data:(ts, succ n);
-          Time_ns.(add (REST.of_ptime ts) @@ Span.of_int_ns @@ succ n)
-      in
-      let price = satoshis_int_of_float_exn price |> Int63.of_int in
-      let qty = satoshis_int_of_float_exn qty |> Int63.of_int in
-      DB.store_trade_in_db db ~ts ~price ~qty ~side
+let tss = String.Table.create ()
 
-let store_trade_in_db = mk_store_trade_in_db ()
-
-module Granulator = struct
-  type t = {
-    nb_streamed : int ;
-    nb_processed : int ;
-    start_ts : Time_ns.t ;
-    end_ts : Time_ns.t ;
-    record : DTC.Historical_price_data_record_response.t ;
-  }
-
-  let create
-      ?(nb_streamed=0) ?(nb_processed=0) ?request_id
-      ~ts ~price ~qty ~side ~span () =
-    let record = DTC.default_historical_price_data_record_response () in
-    record.request_id <- request_id ;
-    record.start_date_time <- Some (Int63.to_int64 (seconds_int63_of_ts ts)) ;
-    record.open_price <- Some price ;
-    record.high_price <- Some price ;
-    record.low_price <- Some price ;
-    record.last_price <- Some price ;
-    record.volume <- Some qty ;
-    record.num_trades <- Some 1l ;
-    record.bid_volume <- if side = `buy then Some qty else None ;
-    record.ask_volume <- if side = `sell then Some qty else None ;
-    {
-      nb_streamed ;
-      nb_processed ;
-      start_ts = ts ;
-      end_ts = Time_ns.(add ts @@ Span.(span - nanosecond)) ;
-      record ;
-    }
-
-  let add_tick ?request_id ~w ~span ~ts ~price ~qty ~side = function
-    | None ->
-      create ?request_id ~span ~ts ~price ~qty ~side ()
-    | Some r ->
-      if Time_ns.between ts ~low:r.start_ts ~high:r.end_ts then begin
-        r.record.high_price <-
-          Option.map r.record.high_price ~f:(Float.max price) ;
-        r.record.low_price <-
-          Option.map r.record.low_price ~f:(Float.min price) ;
-        r.record.last_price <- Some price ;
-        r.record.volume <-
-          Option.map r.record.volume ~f:Float.(( + ) qty) ;
-        r.record.num_trades <-
-          Option.map r.record.num_trades ~f:Int32.succ ;
-        r.record.bid_volume <-
-          Option.map r.record.bid_volume ~f:begin fun b ->
-            if side = `buy then b +. qty else b
-          end ;
-        r.record.ask_volume <-
-          Option.map r.record.ask_volume ~f:begin fun a ->
-            if side = `sell then a +. qty else a
-          end ;
-        { r with nb_processed = succ r.nb_processed }
-      end
-      else begin
-        write_message w `historical_price_data_record_response
-          DTC.gen_historical_price_data_record_response r.record ;
-        create
-          ?request_id
-          ~nb_streamed:(succ r.nb_streamed)
-          ~nb_processed:r.nb_processed
-          ~span ~ts ~price ~qty ~side ()
-      end
-end
+let store_trade_in_db symbol { Trade.ts; price; qty; side; _ } =
+  if !dry_run || side = `buy_sell_unset then ()
+  else
+    let { Instrument.db; _ } = Instrument.find_exn symbol in
+    let ts = match String.Table.find tss symbol with
+      | None ->
+        String.Table.add_exn tss ~key:symbol ~data:(ts, 0);
+        REST.of_ptime ts
+      | Some (old_ts, _) when old_ts <> ts ->
+        String.Table.set tss ~key:symbol ~data:(ts, 0);
+        REST.of_ptime ts
+      | Some (_, n) ->
+        String.Table.set tss ~key:symbol ~data:(ts, succ n);
+        Time_ns.(add (REST.of_ptime ts) @@ Span.of_int_ns @@ succ n)
+    in
+    let price = satoshis_int_of_float_exn price |> Int63.of_int in
+    let qty = satoshis_int_of_float_exn qty |> Int63.of_int in
+    DB.store_trade_in_db db ~ts ~price ~qty ~side
 
 let pump symbol ~start_ts ~end_ts =
   REST.trades ~start_ts ~end_ts symbol >>= function
@@ -319,33 +251,8 @@ let stream_tick_responses symbol
     DTC.gen_historical_price_data_tick_record_response resp ;
   nb_streamed, nb_streamed
 
-let stream_record_responses symbol
-    ?stop db w (req : DTC.Historical_price_data_request.t) start span =
-  Logs.info ~src begin fun m ->
-    m "Streaming %s from %a (%a)" symbol
-      Time_ns.pp start Time_ns.Span.pp span
-  end ;
-  let add_tick = Granulator.add_tick ~w ?request_id:req.request_id ~span in
-  let r =
-    DB.HL.fold_left db ~start ?stop ~init:None ~f:begin fun a t ->
-      let price = Int63.to_float t.p /. 1e8 in
-      let qty = Int63.to_float t.v /. 1e8 in
-      Some (add_tick ~ts:t.ts ~price ~qty ~side:t.side a)
-    end in
-  Option.iter r ~f:begin fun r ->
-    write_message w `historical_price_data_record_response
-      DTC.gen_historical_price_data_record_response r.record ;
-  end ;
-  let resp = DTC.default_historical_price_data_record_response () in
-  resp.request_id <- req.request_id ;
-  resp.is_final_record <- Some true ;
-  write_message w `historical_price_data_record_response
-    DTC.gen_historical_price_data_record_response resp ;
-  Option.value_map r ~default:0 ~f:(fun r -> r.nb_streamed),
-  Option.value_map r ~default:0 ~f:(fun r -> r.nb_processed)
-
 let accept_historical_price_data_request
-    w (req : DTC.Historical_price_data_request.t) db symbol span =
+    w (req : DTC.Historical_price_data_request.t) db symbol =
   let hdr = DTC.default_historical_price_data_response_header () in
   hdr.request_id <- req.request_id ;
   hdr.record_interval <- req.record_interval ;
@@ -363,10 +270,7 @@ let accept_historical_price_data_request
     Int64.to_int_exn |>
     Time_ns.of_int_ns_since_epoch in
   let stop = if stop = Time_ns.epoch then None else Some stop in
-  if span = Time_ns.Span.zero then (* streaming tick responses *)
-    stream_tick_responses symbol ?stop db w req start
-  else
-    stream_record_responses symbol ?stop db w req start span
+  stream_tick_responses symbol ?stop db w req start
 
 let historical_price_data_request addr w msg =
   let req = DTC.parse_historical_price_data_request msg in
@@ -391,15 +295,21 @@ let historical_price_data_request addr w msg =
         ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
         w req "No such symbol" ;
       raise Exit
-    | Some { db ; _ } -> don't_wait_for begin
-        In_thread.run begin fun () ->
-          accept_historical_price_data_request w req db symbol span
-        end >>| fun (nb_streamed, nb_processed) ->
-        Logs.info ~src begin fun m ->
-          m "Streamed %d/%d records from %s"
-            nb_streamed nb_processed symbol
+    | Some { db ; _ } ->
+      if span > Time_ns.Span.zero then
+        reject_historical_price_data_request
+          ~reason_code:`hpdr_unable_to_serve_data_do_not_retry
+          w req "Server can only stream ticks"
+      else
+        don't_wait_for begin
+          In_thread.run begin fun () ->
+            accept_historical_price_data_request w req db symbol
+          end >>| fun (nb_streamed, nb_processed) ->
+          Logs.info ~src begin fun m ->
+            m "Streamed %d/%d records from %s"
+              nb_streamed nb_processed symbol
+          end
         end
-      end
 
 let dtcserver ~server ~port =
   let server_fun addr r w =
@@ -471,8 +381,8 @@ let run ?start port no_pump symbols =
       if no_pump then Deferred.unit
       else
         let thunks = List.fold_left symbols ~init:[] ~f:begin fun a symbol ->
-          List.rev_append (Instrument.thunks_exn ?start symbol (pump symbol)) a
-        end in
+            List.rev_append (Instrument.thunks_exn ?start symbol (pump symbol)) a
+          end in
         Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
     ]
 
