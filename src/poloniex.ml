@@ -1,6 +1,7 @@
 open Core
 open Async
 
+open Plnx
 open Poloniex_global
 open Poloniex_util
 
@@ -11,9 +12,9 @@ module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
 let _ = Clock_ns.every Time_ns.Span.day begin fun () ->
-    String.Table.clear session_high ;
-    String.Table.clear session_low ;
-    String.Table.clear session_volume
+    Pair.Table.clear session_high ;
+    Pair.Table.clear session_low ;
+    Pair.Table.clear session_volume
   end
 
 let failure_of_error e =
@@ -30,16 +31,20 @@ let main span timeout tls uid gid port sc =
     Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
-    Rest.currencies () >>| begin function
-      | Error err -> failwithf "currencies: %s" (Rest.Http_error.to_string err) ()
+    Fastrest.request Rest.currencies >>| begin function
+      | Error err ->
+        failwith (Format.asprintf "currencies: %a"
+                    (Fastrest.pp_print_error Format.pp_print_string) err)
       | Ok currs ->
         List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
     end >>= fun () ->
-    Rest.tickers () >>| begin function
-      | Error err -> failwithf "tickers: %s" (Rest.Http_error.to_string err) ()
+    Fastrest.request Rest.tickers >>| begin function
+      | Error err ->
+        failwith (Format.asprintf "tickers: %a"
+                    (Fastrest.pp_print_error Format.pp_print_string) err)
       | Ok ts ->
-        List.iter ts ~f:begin fun (key, t) ->
-          String.Table.set tickers ~key ~data:(now, t)
+        List.iter ts ~f:begin fun (pair, t) ->
+          Pair.Table.add tickers pair (now, t)
         end
     end >>= fun () ->
     Restsync.Default.run () ;

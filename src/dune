@@ -7,7 +7,7 @@
           poloniex_dtc
           poloniex_global
           poloniex_util
-          connection)
+          poloniex_connection)
  (package poloniex)
  (preprocess (pps ppx_let ppx_sexp_conv))
  (libraries
@@ -24,19 +24,19 @@
   plnx-ws
   plnx-ws-async))
 
-(executable
- (name poloniex_data)
- (public_name poloniex-data)
- (modules poloniex_data)
- (package poloniex-data)
- (preprocess (pps ppx_let ppx_sexp_conv))
- (libraries
-  logs-async-reporter
-  bitv
-  bs-devkit
-  bmex-common
-  leveldb
-  tick
-  dtc-pb
-  plnx-rest
-  plnx-ws))
+; (executable
+;  (name poloniex_data)
+;  (public_name poloniex-data)
+;  (modules poloniex_data)
+;  (package poloniex-data)
+;  (preprocess (pps ppx_let ppx_sexp_conv))
+;  (libraries
+;   logs-async-reporter
+;   bitv
+;   bs-devkit
+;   bmex-common
+;   leveldb
+;   tick
+;   dtc-pb
+;   plnx-rest
+;   plnx-ws))

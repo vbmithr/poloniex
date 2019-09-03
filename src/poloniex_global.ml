@@ -15,10 +15,10 @@ let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
 let sc_mode = ref false
 
-let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
+let subid_to_sym : Pair.t Int.Table.t = Int.Table.create ()
 
 let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
-let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
+let tickers : (Time_ns.t * Ticker.t) Pair.Table.t = Pair.Table.create 13
 
 module Book = struct
   type t = {
@@ -31,22 +31,22 @@ module Book = struct
     book = Float.Map.empty ;
   }
 
-  let bids : t String.Table.t = String.Table.create ()
-  let asks : t String.Table.t = String.Table.create ()
+  let bids : t Pair.Table.t = Pair.Table.create 13
+  let asks : t Pair.Table.t = Pair.Table.create 13
 
-  let get_bids = String.Table.find_or_add bids ~default:(fun () -> empty)
-  let get_asks = String.Table.find_or_add asks ~default:(fun () -> empty)
+  let get_bids sym = match Pair.Table.find_opt bids sym with
+      Some v -> v | None -> Pair.Table.add bids sym empty; empty
+  let get_asks sym = match Pair.Table.find_opt asks sym with
+      Some v -> v | None -> Pair.Table.add asks sym empty; empty
 
-  let set_bids ~symbol ~ts ~book =
-    String.Table.set bids ~key:symbol ~data:{ ts ; book }
-  let set_asks ~symbol ~ts ~book =
-    String.Table.set asks ~key:symbol ~data:{ ts ; book }
+  let set_bids ~symbol ~ts ~book = Pair.Table.add bids symbol { ts ; book }
+  let set_asks ~symbol ~ts ~book = Pair.Table.add asks symbol { ts ; book }
 end
 
-let latest_trades : Trade.t String.Table.t = String.Table.create ()
-let session_high : Float.t String.Table.t = String.Table.create ()
-let session_low : Float.t String.Table.t = String.Table.create ()
-let session_volume : Float.t String.Table.t = String.Table.create ()
+let latest_trades : Trade.t Pair.Table.t = Pair.Table.create 13
+let session_high : Float.t Pair.Table.t = Pair.Table.create 13
+let session_low : Float.t Pair.Table.t = Pair.Table.create 13
+let session_volume : Float.t Pair.Table.t = Pair.Table.create 13
 
 let buf_json = Bi_outbuf.create 4096
 

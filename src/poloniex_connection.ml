@@ -7,6 +7,7 @@ module DTC = Dtc_pb.Dtcprotocol_piqi
 open Bmex_common
 open Poloniex_global
 open Poloniex_util
+open Plnx
 
 type t = {
   addr: Socket.Address.Inet.t;
@@ -16,10 +17,10 @@ type t = {
   secret: string;
   mutable dropped: int;
   mutable most_recent_hb_ts : Time_ns.t;
-  subs: Int32.t String.Table.t;
-  rev_subs : string Int32.Table.t;
-  subs_depth: Int32.t String.Table.t;
-  rev_subs_depth : string Int32.Table.t;
+  subs: Int32.t Pair.Table.t;
+  rev_subs : Pair.t Int32.Table.t;
+  subs_depth: Int32.t Pair.Table.t;
+  rev_subs_depth : Pair.t Int32.Table.t;
   (* Balances *)
   b_exchange: Rest.Balance.t String.Table.t;
   b_margin: Float.t String.Table.t;
@@ -62,59 +63,59 @@ let write_position_update ?(price=0.) ?(qty=0.) w symbol =
   update.unsolicited <- Some true ;
   write_message w `position_update DTC.gen_position_update update
 
-let update_positions { addr; w; key; secret; positions ; _ } =
-  Rest.margin_positions ~buf:buf_json ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err begin fun m ->
-      m "update positions (%a): %a"
-        pp_print_addr addr Rest.Http_error.pp err
-    end
-  | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
-      match p with
-      | None ->
-        String.Table.remove positions symbol ;
-        write_position_update w symbol
-      | Some ({ price; qty; _ } as p) ->
-        String.Table.set positions ~key:symbol ~data:p ;
-        write_position_update w symbol ~price ~qty:(qty *. 1e4)
-    end ;
-    Deferred.unit
+(* let update_positions { addr; w; key; secret; positions ; _ } =
+ *   Rest.margin_positions ~buf:buf_json ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err begin fun m ->
+ *       m "update positions (%a): %a"
+ *         pp_print_addr addr Rest.Http_error.pp err
+ *     end
+ *   | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
+ *       match p with
+ *       | None ->
+ *         String.Table.remove positions symbol ;
+ *         write_position_update w symbol
+ *       | Some ({ price; qty; _ } as p) ->
+ *         String.Table.set positions ~key:symbol ~data:p ;
+ *         write_position_update w symbol ~price ~qty:(qty *. 1e4)
+ *     end ;
+ *     Deferred.unit *)
 
-let update_orders { addr ; key; secret; orders ; _ } =
-  Rest.open_orders ~buf:buf_json ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err begin fun m ->
-      m "update orders (%a): %a" pp_print_addr addr Rest.Http_error.pp err
-    end
-  | Ok os ->
-    Int.Table.clear orders;
-    List.iter os ~f:begin fun (symbol, os) ->
-      List.iter os ~f:begin fun o ->
-        Logs.debug begin fun m ->
-          m "<- [%a] Add %d in order table" pp_print_addr addr o.id
-        end ;
-        Int.Table.set orders ~key:o.id ~data:(symbol, o)
-      end
-    end ;
-    Deferred.unit
+(* let update_orders { addr ; key; secret; orders ; _ } =
+ *   Rest.open_orders ~buf:buf_json ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err begin fun m ->
+ *       m "update orders (%a): %a" pp_print_addr addr Rest.Http_error.pp err
+ *     end
+ *   | Ok os ->
+ *     Int.Table.clear orders;
+ *     List.iter os ~f:begin fun (symbol, os) ->
+ *       List.iter os ~f:begin fun o ->
+ *         Logs.debug begin fun m ->
+ *           m "<- [%a] Add %d in order table" pp_print_addr addr o.id
+ *         end ;
+ *         Int.Table.set orders ~key:o.id ~data:(symbol, o)
+ *       end
+ *     end ;
+ *     Deferred.unit *)
 
-let update_trades { addr; key; secret; trades ; _ } =
-  Rest.trade_history ~buf:buf_json ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err begin fun m ->
-      m "update trades (%a): %a" pp_print_addr addr Rest.Http_error.pp err
-    end
-  | Ok ts ->
-    List.iter ts ~f:begin fun (symbol, ts) ->
-      let old_ts =
-        String.Table.find trades symbol |>
-        Option.value ~default:Rest.TradeHistory.Set.empty in
-      let cur_ts = Rest.TradeHistory.Set.of_list ts in
-      let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
-      String.Table.set trades ~key:symbol ~data:cur_ts;
-      Rest.TradeHistory.Set.iter new_ts ~f:ignore (* TODO: send order update messages *)
-    end ;
-    Deferred.unit
+(* let update_trades { addr; key; secret; trades ; _ } =
+ *   Rest.trade_history ~buf:buf_json ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err begin fun m ->
+ *       m "update trades (%a): %a" pp_print_addr addr Rest.Http_error.pp err
+ *     end
+ *   | Ok ts ->
+ *     List.iter ts ~f:begin fun (symbol, ts) ->
+ *       let old_ts =
+ *         String.Table.find trades symbol |>
+ *         Option.value ~default:Rest.TradeHistory.Set.empty in
+ *       let cur_ts = Rest.TradeHistory.Set.of_list ts in
+ *       let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
+ *       String.Table.set trades ~key:symbol ~data:cur_ts;
+ *       Rest.TradeHistory.Set.iter new_ts ~f:ignore (\* TODO: send order update messages *\)
+ *     end ;
+ *     Deferred.unit *)
 
 let write_margin_balance
     ?request_id
@@ -167,55 +168,55 @@ let write_exchange_balance
       pp_print_addr addr exchange_account msg_number nb_msgs
   end
 
-let update_margin ({ key ; secret ; _ } as conn) =
-  Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err (fun m -> m "%a" Rest.Http_error.pp err)
-  | Ok m ->
-    conn.margin <- m ;
-    Deferred.unit
-
-let update_positive_balances ({ key ; secret ; b_margin ; _ } as conn) =
-  Rest.positive_balances ~buf:buf_json ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err begin fun m ->
-      m "%a" Rest.Http_error.pp err
-    end
-  | Ok bs ->
-    String.Table.clear b_margin;
-    List.Assoc.find ~equal:(=) bs Margin |>
-    Option.iter ~f:begin
-      List.iter ~f:(fun (c, b) -> String.Table.add_exn b_margin ~key:c ~data:b)
-    end ;
-    write_margin_balance conn ;
-    Deferred.unit
-
-let update_balances ({ key ; secret ; b_exchange ; _ } as conn) =
-  Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>= function
-  | Error err ->
-    Logs_async.err begin fun m ->
-      m "%a" Rest.Http_error.pp err
-    end
-  | Ok bs ->
-    String.Table.clear b_exchange;
-    List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange ~key:c ~data:b) ;
-    write_exchange_balance conn ;
-    Deferred.unit
-
-let update_connection conn span =
-  Clock_ns.every
-    ~stop:(Writer.close_started conn.w)
-    ~continue_on_error:true
-    span
-    begin fun () ->
-      let open Restsync.Default in
-      push_nowait (fun () -> update_positions conn) ;
-      push_nowait (fun () -> update_orders conn) ;
-      push_nowait (fun () -> update_trades conn) ;
-      push_nowait (fun () -> update_margin conn) ;
-      push_nowait (fun () -> update_positive_balances conn) ;
-      push_nowait (fun () -> update_balances conn) ;
-    end
+(* let update_margin ({ key ; secret ; _ } as conn) =
+ *   Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err (fun m -> m "%a" Rest.Http_error.pp err)
+ *   | Ok m ->
+ *     conn.margin <- m ;
+ *     Deferred.unit
+ * 
+ * let update_positive_balances ({ key ; secret ; b_margin ; _ } as conn) =
+ *   Rest.positive_balances ~buf:buf_json ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err begin fun m ->
+ *       m "%a" Rest.Http_error.pp err
+ *     end
+ *   | Ok bs ->
+ *     String.Table.clear b_margin;
+ *     List.Assoc.find ~equal:(=) bs Margin |>
+ *     Option.iter ~f:begin
+ *       List.iter ~f:(fun (c, b) -> String.Table.add_exn b_margin ~key:c ~data:b)
+ *     end ;
+ *     write_margin_balance conn ;
+ *     Deferred.unit
+ * 
+ * let update_balances ({ key ; secret ; b_exchange ; _ } as conn) =
+ *   Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>= function
+ *   | Error err ->
+ *     Logs_async.err begin fun m ->
+ *       m "%a" Rest.Http_error.pp err
+ *     end
+ *   | Ok bs ->
+ *     String.Table.clear b_exchange;
+ *     List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange ~key:c ~data:b) ;
+ *     write_exchange_balance conn ;
+ *     Deferred.unit
+ * 
+ * let update_connection conn span =
+ *   Clock_ns.every
+ *     ~stop:(Writer.close_started conn.w)
+ *     ~continue_on_error:true
+ *     span
+ *     begin fun () ->
+ *       let open Restsync.Default in
+ *       push_nowait (fun () -> update_positions conn) ;
+ *       push_nowait (fun () -> update_orders conn) ;
+ *       push_nowait (fun () -> update_trades conn) ;
+ *       push_nowait (fun () -> update_margin conn) ;
+ *       push_nowait (fun () -> update_positive_balances conn) ;
+ *       push_nowait (fun () -> update_balances conn) ;
+ *     end *)
 
 let start_hb log_evt ({ w ; hb_interval ; _ } as conn) =
   let msg = DTC.default_heartbeat () in
@@ -264,9 +265,9 @@ let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
     send_secdefs ;
     dropped = 0 ;
     most_recent_hb_ts = Time_ns.epoch ;
-    subs = String.Table.create () ;
+    subs = Pair.Table.create 13 ;
     rev_subs = Int32.Table.create () ;
-    subs_depth = String.Table.create () ;
+    subs_depth = Pair.Table.create 13 ;
     rev_subs_depth = Int32.Table.create () ;
     b_exchange = String.Table.create () ;
     b_margin = String.Table.create () ;
@@ -280,9 +281,9 @@ let setup ~log_evt ~addr ~w ~key ~secret ~send_secdefs ~hb_interval =
   set ~key:addr ~data:conn ;
   conn
 
-let setup_trading ~key ~secret conn =
-  Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
-  | Error _ -> false
-  | Ok _ ->
-    update_connection conn !update_client_span ;
-    true
+(* let setup_trading ~key ~secret conn =
+ *   Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
+ *   | Error _ -> false
+ *   | Ok _ ->
+ *     update_connection conn !update_client_span ;
+ *     true *)

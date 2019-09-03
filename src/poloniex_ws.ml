@@ -5,6 +5,7 @@ open Plnx
 open Bmex_common
 open Poloniex_util
 open Poloniex_global
+module Conn = Poloniex_connection
 
 module Ws = Plnx_ws
 
@@ -15,12 +16,12 @@ let at_bid_or_ask_of_depth : Side.t -> DTC.at_bid_or_ask_enum = function
 
 let send_depth_update
     (update : DTC.Market_depth_update_level.t)
-    w (u : Plnx.BookEntry.t) =
+    w side (u : Plnx.BookEntry.t) =
   let update_type =
     if u.qty = 0.
     then `market_depth_delete_level
     else `market_depth_insert_update_level in
-  update.side <- Some (at_bid_or_ask_of_depth u.side) ;
+  update.side <- Some (at_bid_or_ask_of_depth side) ;
   update.update_type <- Some update_type ;
   update.price <- Some u.price ;
   update.quantity <- Some u.qty ;
@@ -34,7 +35,7 @@ let send_bidask_update
   write_message w `market_data_update_bid_ask
     DTC.gen_market_data_update_bid_ask update
 
-let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
+let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
   let old_bids = (Book.get_bids pair).book in
   let old_asks = (Book.get_asks pair).book in
   let old_best_bid = Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt old_bids) in
@@ -69,29 +70,29 @@ let on_book_update pair ts ({ Plnx.BookEntry.side; price; qty } as u) =
       if new_best_ask < old_best_ask then
         Some (old_best_bid, new_best_ask) else None
   in
-  let on_connection { Connection.addr; w; subs; subs_depth ; _ } =
+  let on_connection { Conn.addr; w; subs; subs_depth ; _ } =
     let update_depth symbol_id =
       depth_update.symbol_id <- Some symbol_id ;
       Log.debug begin fun m ->
-        m "-> [%a] %s D %a"
-          pp_print_addr addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
+        m "-> [%a] %a D %a"
+          pp_print_addr addr Pair.pp pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
       end ;
-      send_depth_update depth_update w u
+      send_depth_update depth_update w side u
     in
     let update_bidask symbol_id (bid, ask) =
       bidask_update.symbol_id <- Some symbol_id ;
       Log.debug begin fun m ->
-        m "-> [%a] %s BIDASK %a"
-          pp_print_addr addr pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
+        m "-> [%a] %a BIDASK %a"
+          pp_print_addr addr Pair.pp pair Sexp.pp_hum (Plnx.BookEntry.sexp_of_t u)
       end ;
       send_bidask_update bidask_update w bid ask
     in
-    match String.Table.(find subs pair, find subs_depth pair) with
+    match Pair.Table.(find_opt subs pair, find_opt subs_depth pair) with
     | _, Some symbol_id -> update_depth symbol_id
     | Some symbol_id, _ -> Option.iter new_best_bidask ~f:(update_bidask symbol_id)
     | _ -> ()
   in
-  Connection.iter ~f:on_connection
+  Conn.iter ~f:on_connection
 
 let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
   | `buy -> `at_ask
@@ -99,30 +100,30 @@ let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
   | `buy_sell_unset -> `bid_ask_unset
 
 let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
-  String.Table.set latest_trades ~key:pair ~data:t ;
+  Pair.Table.add latest_trades pair t ;
   let session_high =
     let h =
-      Option.value ~default:Float.min_value (String.Table.find session_high pair) in
+      Option.value ~default:Float.min_value (Pair.Table.find_opt session_high pair) in
     if h < t.price then begin
-      String.Table.set session_high ~key:pair ~data:t.price ;
+      Pair.Table.add session_high pair t.price ;
       Some t.price
     end else None in
   let session_low =
-    let l = Option.value ~default:Float.max_value (String.Table.find session_low pair) in
+    let l = Option.value ~default:Float.max_value (Pair.Table.find_opt session_low pair) in
     if l > t.price then begin
-      String.Table.set session_low ~key:pair ~data:t.price ;
+      Pair.Table.add session_low pair t.price ;
       Some t.price
     end else None in
-  String.Table.set session_volume ~key:pair ~data:begin
-    match (String.Table.find session_volume pair) with
+  Pair.Table.add session_volume pair begin
+    match (Pair.Table.find_opt session_volume pair) with
     | None -> t.qty
     | Some qty -> qty +. t.qty
   end ;
   Log.debug begin fun m ->
-    m "<- %s %a" pair Sexp.pp_hum (Trade.sexp_of_t t)
+    m "<- %a %a" Pair.pp pair Sexp.pp_hum (Trade.sexp_of_t t)
   end ;
   (* Send trade updates to subscribers. *)
-  let on_connection { Connection.w ; subs ; _ } =
+  let on_connection { Conn.w ; subs ; _ } =
     let on_symbol_id symbol_id =
       trade_update.symbol_id <- Some symbol_id ;
       trade_update.at_bid_or_ask <- Some (at_bid_or_ask_of_trade side) ;
@@ -144,9 +145,9 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
           DTC.gen_market_data_update_session_high session_high_update
       end
     in
-    Option.iter String.Table.(find subs pair) ~f:on_symbol_id
+    Option.iter Pair.Table.(find_opt subs pair) ~f:on_symbol_id
   in
-  Connection.iter ~f:on_connection
+  Conn.iter ~f:on_connection
 
 module N = struct
   let base = ["ws"]
@@ -160,9 +161,9 @@ module E = struct
     | Watchdog
     | Close_started
     | Close_finished
-    | Snapshot of string
-    | Trade of string
-    | BookEntry of string
+    | Snapshot of Pair.t
+    | Trade of Pair.t
+    | BookEntry of Side.t * Pair.t
 
     | TradesPerMinute of int
     | BookEntriesPerMinute of int
@@ -226,6 +227,9 @@ module Handlers : HANDLERS
   with type self = bounded queue t = struct
   type self = bounded queue t
 
+  let on_launch_complete _ =
+    Deferred.unit
+
   let on_request self { R.ts ; evt = { chanid; seqnum = _; events } ; ret } =
     List.iter events ~f:begin function
       | Ws.Snapshot { symbol ; bid ; ask } ->
@@ -233,15 +237,16 @@ module Handlers : HANDLERS
         Int.Table.set subid_to_sym ~key:chanid ~data:symbol ;
         Book.set_bids ~symbol ~ts ~book:bid ;
         Book.set_asks ~symbol ~ts ~book:ask ;
-      | BookEntry entry ->
-        let symbol = Int.Table.find_exn subid_to_sym chanid in
-        record_event self (BookEntry symbol) ;
-        on_book_update symbol ts entry
+      | BookEntry (side, entry) ->
+        let pair = Int.Table.find_exn subid_to_sym chanid in
+        record_event self (BookEntry (side, pair)) ;
+        on_book_update pair ts side entry
       | Trade t ->
-        let symbol = Int.Table.find_exn subid_to_sym chanid in
-        record_event self (Trade symbol) ;
-        on_trade_update symbol t
+        let pair = Int.Table.find_exn subid_to_sym chanid in
+        record_event self (Trade pair) ;
+        on_trade_update pair t
       | Ticker _ -> ()
+      | Err _ -> ()
     end ;
     return ret
 
@@ -251,12 +256,16 @@ module Handlers : HANDLERS
       | Launching _, None -> invalid_arg "init_connection"
       | Launching _, Some buf -> buf
       | _, _ -> (state self).buf in
-    let symbols = String.Table.keys tickers in
-    Monitor.try_with begin fun () ->
-      Plnx_ws_async.connect ~buf () >>= fun (r, w, cleaned_up) ->
+    let pairs = Pair.Table.fold (fun k _v a -> k::a) tickers [] in
+    Plnx_ws_async.connect ~buf () >>= function
+    | Error _e ->
+      Log_async.err (fun m -> m "PLNX connect error") >>= fun () ->
+      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
+      init_connection ~buf self
+    | Ok (r, w, cleaned_up) ->
       log_event self Connect >>= fun () ->
-      Deferred.List.iter symbols ~f:begin fun symbol ->
-        Pipe.write w (Ws.Subscribe (`String symbol, None))
+      Deferred.List.iter pairs ~f:begin fun pair ->
+        Pipe.write w (Ws.Subscribe (Plnx_ws.TradesQuotes pair))
       end >>= fun () ->
       Pipe.close w ;
       let push_request evt =
@@ -264,12 +273,6 @@ module Handlers : HANDLERS
         push_request self { ts ; evt ; ret = () } in
       don't_wait_for (Pipe.iter r ~f:push_request) ;
       return { V.r ; cleaned_up }
-    end >>= function
-    | Ok c -> return c
-    | Error exn ->
-      Log_async.err (fun m -> m "%a" Exn.pp exn) >>= fun () ->
-      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
-      init_connection ~buf self
 
   let on_close self =
     let { V.conn = { V.r ; cleaned_up } ; _ } = state self in
@@ -289,7 +292,7 @@ module Handlers : HANDLERS
         let evts = latest_events ~after:!old_ts self in
         old_ts := Time_ns.now () ;
         let evts = List.Assoc.find_exn
-            ~equal:Pervasives.(=) evts Logs.Info in
+            ~equal:Stdlib.(=) evts Logs.Info in
         let nb_trades =
           Array.count evts ~f:begin fun (_, evt) ->
             match evt with E.Trade _ -> true | _ -> false
