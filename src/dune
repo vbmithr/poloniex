@@ -14,6 +14,7 @@
   core
   async
   actor
+  conduit-async
   logs-async
   logs-async-reporter
   logs-async-ovh
