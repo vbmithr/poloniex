@@ -32,16 +32,12 @@ let main span timeout tls uid gid port sc =
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
     Fastrest.request Rest.currencies >>| begin function
-      | Error err ->
-        failwith (Format.asprintf "currencies: %a"
-                    (Fastrest.pp_print_error Format.pp_print_string) err)
+      | Error err -> Error.raise err
       | Ok currs ->
         List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
     end >>= fun () ->
     Fastrest.request Rest.tickers >>| begin function
-      | Error err ->
-        failwith (Format.asprintf "tickers: %a"
-                    (Fastrest.pp_print_error Format.pp_print_string) err)
+      | Error err -> Error.raise err
       | Ok ts ->
         List.iter ts ~f:begin fun (pair, t) ->
           Pair.Table.add tickers pair (now, t)
