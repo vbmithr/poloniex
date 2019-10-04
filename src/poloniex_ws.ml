@@ -248,7 +248,7 @@ module Handlers : HANDLERS
       | Ticker _ -> ()
       | Err _ -> ()
     end ;
-    return ret
+    Deferred.Or_error.return ret
 
   let rec init_connection ?buf self =
     let buf =
