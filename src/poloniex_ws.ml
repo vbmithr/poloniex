@@ -149,12 +149,6 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
   in
   Conn.iter ~f:on_connection
 
-module N = struct
-  let base = ["ws"]
-  type t = string
-  let pp = Format.pp_print_string
-  let to_string t = Format.asprintf "%a" pp t
-end
 module E = struct
   type t =
     | Connect
@@ -220,7 +214,7 @@ module V = struct
   let view _ () = ()
   let pp ppf _ = Format.pp_print_string ppf ""
 end
-module A = Actor.Make(N)(E)(R)(V)
+module A = Actor.Make(E)(R)(V)
 include A
 
 module Handlers : HANDLERS

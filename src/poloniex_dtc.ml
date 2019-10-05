@@ -10,12 +10,6 @@ module Conn = Poloniex_connection
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
-module N = struct
-  let base = ["dtc"]
-  type t = string
-  let pp = Format.pp_print_string
-  let to_string t = Format.asprintf "%a" pp t
-end
 module E = struct
   type trade_mode_enum =
     [ `trade_mode_demo
@@ -106,7 +100,7 @@ module V = struct
   let view _ _ = ()
   let pp ppf _ = Format.pp_print_string ppf ""
 end
-module A = Actor.Make(N)(E)(R)(V)
+module A = Actor.Make(E)(R)(V)
 include A
 
 let encoding_request addr w =

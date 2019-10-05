@@ -48,18 +48,20 @@ let main span timeout tls uid gid port sc =
     Option.iter uid ~f:Core.Unix.setuid ;
     Option.iter gid ~f:Core.Unix.setgid ;
     Poloniex_ws.launch
+      ~base_name:["poloniex"] ~name:"ws"
       (Poloniex_ws.bounded 10) ~timeout
       (Actor.Types.create_limits
          ?backlog_level:(Logs.Src.level src)
          ~backlog_size:100_000
-         ()) "main" ()
+         ()) ()
       (module Poloniex_ws.Handlers) >>= fun _ws_worker ->
     Poloniex_dtc.launch
+      ~base_name:["poloniex"] ~name:"dtc"
       (Poloniex_dtc.bounded 10)
       (Actor.Types.create_limits
          ?backlog_level:(Logs.Src.level src)
          ~backlog_size:50_000
-         ()) "main" { server ; port }
+         ()) { server ; port }
       (module Poloniex_dtc.Handlers) >>= fun _dtc_worker ->
     Deferred.never ()
   end
