@@ -97,10 +97,10 @@ let () =
       and gid =
         flag "setgid" (optional int) ~doc:" Set gid after reading TLS file"
       and () =
-        Logs_async_reporter.set_level_via_param None
+        Logs_async_reporter.set_level_via_param []
       and () =
         Logs_async_reporter.set_level_via_param
-          ~arg_name:"local-log-level" (Some src) in
+          ~arg_name:"local-log-level" [src] in
       fun () ->
         let tls =
           match crt, key with
