@@ -10,9 +10,8 @@ module Conn = Poloniex_connection
 module Ws = Plnx_ws
 
 let at_bid_or_ask_of_depth : Side.t -> DTC.at_bid_or_ask_enum = function
-  | `buy -> `at_bid
-  | `sell -> `at_ask
-  | `buy_sell_unset -> `bid_ask_unset
+  | Buy -> `at_bid
+  | Sell -> `at_ask
 
 let send_depth_update
     (update : DTC.Market_depth_update_level.t)
@@ -41,15 +40,14 @@ let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
   let old_best_bid = Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt old_bids) in
   let old_best_ask = Option.value_map ~f:fst ~default:Float.max_value (Float.Map.min_elt old_asks) in
   let _book, new_book = match side with
-    | `buy_sell_unset -> invalid_arg "on_book_updates: side unset"
-    | `buy ->
+    | Fixtypes.Side.Buy ->
       let { Book.book ; _ } = Book.get_bids pair in
       let new_book =
         (if qty > 0. then Float.Map.set book ~key:price ~data:qty
          else Float.Map.remove book price) in
       Book.set_bids ~symbol:pair ~ts ~book:new_book ;
       book, new_book
-    | `sell ->
+    | Sell ->
       let { Book.book ; _ } = Book.get_asks pair in
       let new_book =
         (if qty > 0. then Float.Map.set book ~key:price ~data:qty
@@ -58,13 +56,12 @@ let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
       book, new_book
   in
   let new_best_bidask = match side with
-    | `buy_sell_unset -> None
-    | `buy ->
+    | Fixtypes.Side.Buy ->
       let new_best_bid =
         Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt new_book) in
       if new_best_bid > old_best_bid then
         Some (new_best_bid, old_best_ask) else None
-    | `sell ->
+    | Sell ->
       let new_best_ask =
         Option.value_map ~f:fst ~default:Float.max_value (Float.Map.min_elt new_book) in
       if new_best_ask < old_best_ask then
@@ -95,9 +92,8 @@ let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
   Conn.iter ~f:on_connection
 
 let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
-  | `buy -> `at_ask
-  | `sell -> `at_bid
-  | `buy_sell_unset -> `bid_ask_unset
+  | Fixtypes.Side.Buy -> `at_ask
+  | Sell -> `at_bid
 
 let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
   Pair.Table.add latest_trades pair t ;
@@ -163,25 +159,6 @@ module E = struct
     | BookEntriesPerMinute of int
   [@@deriving sexp]
 
-  let http_port =
-    Option.map ~f:Int.of_string (Sys.getenv "PLNX_WS_HTTP_PORT")
-
-  let warp10_url =
-    Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
-
-  let to_warp10 = function
-    | TradesPerMinute i ->
-      Option.some @@ Warp10.create
-        ~labels:["event", "trades_per_minute"]
-        ~name:"poloniex.ws"
-        (Warp10.Long (Int64.of_int i))
-    | BookEntriesPerMinute i ->
-      Option.some @@ Warp10.create
-        ~labels:["event", "bookentries_per_minute"]
-        ~name:"poloniex.ws"
-        (Warp10.Long (Int64.of_int i))
-    | _ -> None
-
   let dummy = Connect
   let level = function
     | BookEntry _ -> Logs.Info
@@ -197,17 +174,13 @@ module R = struct
   }
   type view = { ts: Time_ns.t ; evt: Plnx_ws.t } [@@deriving sexp]
   let view { ts ; evt ; ret = _ } = { ts ; evt }
+  let level _ = Logs.Debug
   let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_view v)
 end
 module V = struct
-  type conn =
-    { r : Plnx_ws.t Pipe.Reader.t ;
-      cleaned_up : unit Deferred.t ;
-    }
-
   type state = {
     buf : Bi_outbuf.t ;
-    mutable conn : conn
+    mutable feed : Plnx_ws.t Pipe.Reader.t ;
   }
   type parameters = unit
   type view = unit
@@ -251,12 +224,12 @@ module Handlers : HANDLERS
       | Launching _, Some buf -> buf
       | _, _ -> (state self).buf in
     let pairs = Pair.Table.fold (fun k _v a -> k::a) tickers [] in
-    Plnx_ws_async.connect ~buf () >>= function
+    Plnx_ws_async.connect ~buf Plnx_ws.url >>= function
     | Error _e ->
       Log_async.err (fun m -> m "PLNX connect error") >>= fun () ->
       Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
       init_connection ~buf self
-    | Ok (r, w, cleaned_up) ->
+    | Ok { r; w } ->
       log_event self Connect >>= fun () ->
       Deferred.List.iter pairs ~f:begin fun pair ->
         Pipe.write w (Ws.Subscribe (Plnx_ws.TradesQuotes pair))
@@ -266,21 +239,21 @@ module Handlers : HANDLERS
         let ts = Time_ns.now () in
         push_request self { ts ; evt ; ret = () } in
       don't_wait_for (Pipe.iter r ~f:push_request) ;
-      return { V.r ; cleaned_up }
+      return r
 
   let on_close self =
-    let { V.conn = { V.r ; cleaned_up } ; _ } = state self in
+    let r = (state self).feed in
     log_event self Close_started >>= fun () ->
     Pipe.close_read r ;
-    don't_wait_for (cleaned_up >>= fun () -> log_event self Close_finished) ;
+    (Pipe.closed r >>> fun () -> log_event_now self Close_finished) ;
     Deferred.unit
 
   let on_launch self _ _ =
     let buf = Bi_outbuf.create 4096 in
-    init_connection ~buf self >>= fun conn ->
+    init_connection ~buf self >>= fun feed ->
     let old_ts = ref Time_ns.min_value in
     Clock_ns.every'
-      ~stop:conn.cleaned_up
+      ~stop:(Pipe.closed feed)
       ~continue_on_error:false (Time_ns.Span.of_int_sec 60)
       begin fun () ->
         let evts = latest_events ~after:!old_ts self in
@@ -298,15 +271,15 @@ module Handlers : HANDLERS
         log_event self (E.TradesPerMinute nb_trades) >>= fun () ->
         log_event self (E.BookEntriesPerMinute nb_bookentries)
       end ;
-    return { V.buf ; conn }
+    return { V.buf ; feed }
 
   let on_no_request self =
     (* Reinitialize dead connection *)
     log_event self Watchdog >>= fun () ->
     on_close self >>= fun () ->
-    init_connection self >>= fun conn ->
+    init_connection self >>= fun feed ->
     let s = state self in
-    s.conn <- conn ;
+    s.feed <- feed ;
     Deferred.unit
 
   let on_completion _self _req _arg _status =

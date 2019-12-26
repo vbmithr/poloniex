@@ -87,6 +87,7 @@ module R = struct
   }
   type view = unit [@@deriving sexp]
   let view { ret = _ } = ()
+  let level _ = Logs.Debug
   let pp ppf v = Sexplib.Sexp.pp ppf (sexp_of_view v)
 end
 module V = struct
@@ -443,7 +444,7 @@ let send_open_order_update w request_id nb_open_orders
   resp.exchange <- Some my_exchange ;
   resp.server_order_id <- Some (Int.to_string id) ;
   resp.order_type <- Some `order_type_limit ;
-  resp.buy_sell <- Some side ;
+  resp.buy_sell <- Some (match side with Sell -> `sell | Buy -> `buy) ;
   resp.price1 <- Some price ;
   resp.order_quantity <- Some (starting_qty *. 1e4) ;
   resp.filled_quantity <- Some ((starting_qty -. qty) *. 1e4) ;
@@ -536,7 +537,7 @@ let send_order_fill ?(nb_msgs=1) ~symbol
   resp.symbol <- Some symbol ;
   resp.exchange <- Some my_exchange ;
   resp.server_order_id <- Some (Int.to_string gid) ;
-  resp.buy_sell <- Some side ;
+  resp.buy_sell <- Some (match side with Buy -> `buy | Sell -> `sell) ;
   resp.price <- Some price ;
   resp.quantity <- Some qty ;
   resp.date_time <- Some (int64_of_time ts) ;
@@ -683,7 +684,11 @@ let send_new_order_update w (req : DTC.submit_new_single_order)
   write_message w `order_update DTC.gen_order_update update
 
 let open_order_of_submit_new_single_order id (req : DTC.Submit_new_single_order.t) margin =
-  let side = Option.value ~default:`buy_sell_unset req.buy_sell in
+  let side =
+    match req.buy_sell with
+    | Some `buy -> Fixtypes.Side.Buy
+    | Some `sell -> Sell
+    | _ -> invalid_arg "open_order_of_submit_new_single_order" in
   let price = Option.value ~default:0. req.price1 in
   let qty = Option.value_map req.quantity ~default:0. ~f:(( *. ) 1e-4) in
   let margin = if margin then 1 else 0 in
