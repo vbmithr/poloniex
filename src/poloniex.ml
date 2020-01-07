@@ -31,17 +31,13 @@ let main span timeout tls uid gid port sc =
     Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
-    Fastrest.request Rest.currencies >>| begin function
-      | Error err -> Error.raise err
-      | Ok currs ->
-        List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
+    Fastrest.request Rest.currencies >>| begin fun currs ->
+      List.iter currs ~f:(fun (c, t) -> String.Table.set currencies ~key:c ~data:t)
     end >>= fun () ->
-    Fastrest.request Rest.tickers >>| begin function
-      | Error err -> Error.raise err
-      | Ok ts ->
-        List.iter ts ~f:begin fun (pair, t) ->
-          Pair.Table.add tickers pair (now, t)
-        end
+    Fastrest.request Rest.tickers >>| begin fun ts ->
+      List.iter ts ~f:begin fun (pair, t) ->
+        Pair.Table.add tickers pair (now, t)
+      end
     end >>= fun () ->
     Restsync.Default.run () ;
     conduit_server ?tls () >>= fun server ->

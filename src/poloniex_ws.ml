@@ -215,31 +215,30 @@ module Handlers : HANDLERS
       | Ticker _ -> ()
       | Err _ -> ()
     end ;
-    Deferred.Or_error.return ret
+    return ret
 
-  let rec init_connection ?buf self =
+  let init_connection ?buf self =
     let buf =
       match status self, buf with
       | Launching _, None -> invalid_arg "init_connection"
       | Launching _, Some buf -> buf
       | _, _ -> (state self).buf in
     let pairs = Pair.Table.fold (fun k _v a -> k::a) tickers [] in
-    Plnx_ws_async.connect ~buf Plnx_ws.url >>= function
-    | Error _e ->
-      Log_async.err (fun m -> m "PLNX connect error") >>= fun () ->
-      Clock_ns.after (Time_ns.Span.of_int_sec 10) >>= fun () ->
-      init_connection ~buf self
-    | Ok { r; w } ->
-      log_event self Connect >>= fun () ->
-      Deferred.List.iter pairs ~f:begin fun pair ->
-        Pipe.write w (Ws.Subscribe (Plnx_ws.TradesQuotes pair))
-      end >>= fun () ->
-      Pipe.close w ;
-      let push_request evt =
-        let ts = Time_ns.now () in
-        push_request self { ts ; evt ; ret = () } in
-      don't_wait_for (Pipe.iter r ~f:push_request) ;
-      return r
+    (* TODO: persistent connection *)
+    Fastws_async.connect
+      ~of_string:(Ws.of_string ~buf)
+      ~to_string:(Ws.string_of_command ~buf)
+      Plnx_ws.url >>= fun {r; w } ->
+    log_event self Connect >>= fun () ->
+    Deferred.List.iter pairs ~f:begin fun pair ->
+      Pipe.write w (Ws.Subscribe (Plnx_ws.TradesQuotes pair))
+    end >>= fun () ->
+    Pipe.close w ;
+    let push_request evt =
+      let ts = Time_ns.now () in
+      push_request self { ts ; evt ; ret = () } in
+    don't_wait_for (Pipe.iter r ~f:push_request) ;
+    return r
 
   let on_close self =
     let r = (state self).feed in

@@ -22,8 +22,7 @@
   bmex-common
   dtc-pb
   plnx-rest
-  plnx-ws
-  plnx-ws-async))
+  plnx-ws))
 
 ; (executable
 ;  (name poloniex_data)

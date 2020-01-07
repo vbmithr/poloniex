@@ -1114,7 +1114,7 @@ module Handlers : HANDLERS
   let on_launch_complete _ = Deferred.unit
 
   let on_request _self { R.ret } =
-    Deferred.Or_error.return ret
+    return ret
 
   let on_close _self =
     Deferred.unit
