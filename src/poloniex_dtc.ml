@@ -243,7 +243,7 @@ let security_definition_request log_evt addr w msg =
           m "<- [%a] Sec Def Request %ld %a %s"
             pp_print_addr addr request_id Pair.pp pair exchange
         end ;
-        if exchange <> my_exchange then reject request_id symbol
+        if not (String.equal exchange my_exchange) then reject request_id symbol
         else begin match Pair.Table.mem tickers pair with
           | false -> reject request_id symbol
           | true ->
@@ -285,7 +285,7 @@ let write_market_data_snapshot ?id pair w =
   let bid = Book.get_bids pair in
   let ask = Book.get_asks pair in
   let ts = Time_ns.max bid.ts ask.ts in
-  if ts <> Time_ns.epoch then
+  if Time_ns.is_later ts ~than:Time_ns.epoch then
     snap.bid_ask_date_time <- Some (float_of_time ts) ;
   Option.iter (Float.Map.max_elt bid.book) ~f:begin fun (price, qty) ->
     snap.bid_price <- Some price ;
@@ -307,7 +307,7 @@ let market_data_request log_evt addr w msg =
   with
   | _,_, Some (Error symbol), _ ->
     reject_market_data_request addr w "Wrongly formatted pair %s" symbol
-  | _, id, _, Some exchange when exchange <> my_exchange ->
+  | _, id, _, Some exchange when not (String.equal exchange my_exchange) ->
     reject_market_data_request ?id addr w "No such exchange %s" exchange
   | _, id, Some (Ok pair), _ when not (Pair.Table.mem tickers pair) ->
     reject_market_data_request ?id addr w "No such symbol %a" Pair.pp pair
@@ -405,7 +405,7 @@ let market_depth_request log_evt addr w msg =
   with
   | _, _, Some (Error symbol), _ ->
     reject_market_data_request addr w "Wrongly formatted pair %s" symbol
-  | _, id, _, Some exchange when exchange <> my_exchange ->
+  | _, id, _, Some exchange when not (String.equal exchange my_exchange) ->
     reject_market_depth_request ?id addr w "No such exchange %s" exchange
   | _, id, Some (Ok pair), _ when not (Pair.Table.mem tickers pair) ->
     reject_market_depth_request ?id addr w "No such symbol %a" Pair.pp pair
@@ -433,7 +433,7 @@ let market_depth_request log_evt addr w msg =
 let send_open_order_update w request_id nb_open_orders
     ~key:_ ~data:(symbol, { Rest.OpenOrder.id; side; price; qty; starting_qty; _ } ) i =
   let resp = DTC.default_order_update () in
-  let status = if qty = starting_qty then
+  let status = if Float.equal qty starting_qty then
       `order_status_open else `order_status_partially_filled in
   resp.request_id <- Some request_id ;
   resp.total_num_messages <- Some (Int32.of_int_exn nb_open_orders) ;
@@ -628,12 +628,12 @@ let account_balance_request addr msg =
     end ;
     Conn.write_exchange_balance ?request_id:req.request_id ~msg_number:1 ~nb_msgs:2 c;
     Conn.write_margin_balance ?request_id:req.request_id ~msg_number:2 ~nb_msgs:2 c
-  | Some account when account = exchange_account ->
+  | Some account when String.equal account exchange_account ->
     Log.debug begin fun m ->
       m "<- [%a] AccountBalanceRequest (%s)" pp_print_addr c.addr account
     end ;
     Conn.write_exchange_balance ?request_id:req.request_id c
-  | Some account when account = margin_account ->
+  | Some account when String.equal account margin_account ->
     Log.debug begin fun m ->
       m "<- [%a] AccountBalanceRequest (%s)" pp_print_addr c.addr account
     end ;

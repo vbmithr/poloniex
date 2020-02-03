@@ -233,16 +233,16 @@ let purge { addr ; w ; _ } =
   Log_async.info (fun m -> m "purged connection %a" pp_print_addr addr)
 
 let gc () =
+  let open Time_ns in
   let stop = Ivar.create () in
   Clock_ns.every ~stop:(Ivar.read stop)
     ~continue_on_error:false
     (Time_ns.Span.of_int_sec 600) begin fun () ->
-    let now = Time_ns.now () in
+    let now = now () in
     active :=
       AddrMap.fold !active ~init:AddrMap.empty ~f:begin fun ~key ~data a ->
-        if data.most_recent_hb_ts > Time_ns.epoch &&
-           Time_ns.diff now data.most_recent_hb_ts >
-           Time_ns.Span.of_int_sec 240
+        if is_later data.most_recent_hb_ts ~than:Time_ns.epoch &&
+           Span.((diff now data.most_recent_hb_ts) > (of_int_sec 240))
         then (don't_wait_for (purge data) ; a)
         else AddrMap.set a ~key ~data
       end

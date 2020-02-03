@@ -17,7 +17,7 @@ let send_depth_update
     (update : DTC.Market_depth_update_level.t)
     w side (u : Plnx.BookEntry.t) =
   let update_type =
-    if u.qty = 0.
+    if Float.equal u.qty 0.
     then `market_depth_delete_level
     else `market_depth_insert_update_level in
   update.side <- Some (at_bid_or_ask_of_depth side) ;
@@ -43,15 +43,15 @@ let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
     | Fixtypes.Side.Buy ->
       let { Book.book ; _ } = Book.get_bids pair in
       let new_book =
-        (if qty > 0. then Float.Map.set book ~key:price ~data:qty
-         else Float.Map.remove book price) in
+        Float.(if qty > 0. then Map.set book ~key:price ~data:qty
+         else Map.remove book price) in
       Book.set_bids ~symbol:pair ~ts ~book:new_book ;
       book, new_book
     | Sell ->
       let { Book.book ; _ } = Book.get_asks pair in
       let new_book =
-        (if qty > 0. then Float.Map.set book ~key:price ~data:qty
-         else Float.Map.remove book price) in
+        Float.(if qty > 0. then Map.set book ~key:price ~data:qty
+               else Map.remove book price) in
       Book.set_asks ~symbol:pair ~ts ~book:new_book ;
       book, new_book
   in
@@ -59,12 +59,12 @@ let on_book_update pair ts side ({ Plnx.BookEntry.price; qty } as u) =
     | Fixtypes.Side.Buy ->
       let new_best_bid =
         Option.value_map ~f:fst ~default:Float.min_value (Float.Map.max_elt new_book) in
-      if new_best_bid > old_best_bid then
+      if Float.(new_best_bid > old_best_bid) then
         Some (new_best_bid, old_best_ask) else None
     | Sell ->
       let new_best_ask =
         Option.value_map ~f:fst ~default:Float.max_value (Float.Map.min_elt new_book) in
-      if new_best_ask < old_best_ask then
+      if Float.(new_best_ask < old_best_ask) then
         Some (old_best_bid, new_best_ask) else None
   in
   let on_connection { Conn.addr; w; subs; subs_depth ; _ } =
@@ -100,13 +100,13 @@ let on_trade_update pair ({ Trade.ts; side; price; qty; _ } as t) =
   let session_high =
     let h =
       Option.value ~default:Float.min_value (Pair.Table.find_opt session_high pair) in
-    if h < t.price then begin
+    if Float.(h < t.price) then begin
       Pair.Table.add session_high pair t.price ;
       Some t.price
     end else None in
   let session_low =
     let l = Option.value ~default:Float.max_value (Pair.Table.find_opt session_low pair) in
-    if l > t.price then begin
+    if Float.(l > t.price) then begin
       Pair.Table.add session_low pair t.price ;
       Some t.price
     end else None in
@@ -250,7 +250,7 @@ module Handlers : HANDLERS
   let on_launch self _ _ =
     let buf = Bi_outbuf.create 4096 in
     init_connection ~buf self >>= fun feed ->
-    let old_ts = ref Time_ns.min_value in
+    let old_ts = ref Time_ns.epoch in
     Clock_ns.every'
       ~stop:(Pipe.closed feed)
       ~continue_on_error:false (Time_ns.Span.of_int_sec 60)
