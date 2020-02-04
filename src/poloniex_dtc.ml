@@ -59,17 +59,6 @@ module E = struct
   let http_port =
     Option.map ~f:Int.of_string (Sys.getenv "PLNX_DTC_HTTP_PORT")
 
-  let warp10_url =
-    Option.map ~f:Uri.of_string (Sys.getenv "OVH_METRICS_URL")
-
-  let to_warp10 { evt ; _ } = match evt with
-    | NbConnected i ->
-      Option.some @@ Warp10.create
-        ~labels:["event", "nb_connected"]
-        ~name:"poloniex.dtc"
-        (Warp10.Long (Int64.of_int i))
-    | _ -> None
-
   let create src evt = { src ; evt }
   let nb_connected src i = { src ; evt = NbConnected i }
   let dummy = create

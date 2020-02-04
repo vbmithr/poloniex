@@ -26,9 +26,9 @@ let main span timeout tls uid gid port sc =
   sc_mode := sc ;
   update_client_span := span ;
   stage begin fun `Scheduler_started ->
-    let logs =
+    let ovh_url =
       Option.Monad_infix.(Sys.getenv "OVH_LOGS_URL" >>| Uri.of_string) in
-    Logs_async_ovh.udp_reporter ?logs () >>= fun reporter ->
+    Logs_async_ovh.udp_reporter ?ovh_url () >>= fun reporter ->
     Logs.set_reporter reporter ;
     let now = Time_ns.now () in
     Fastrest.request Rest.currencies >>| begin fun currs ->
